@@ -274,7 +274,7 @@ export default function AddAreaPage() {
               {/* ── Rent SEO & Content ── */}
               <div className="p-4 bg-blue-50 rounded-lg border border-blue-100 space-y-4">
                 <div>
-                  <h3 className="text-lg font-semibold text-blue-700">
+                  <h3 className="text-lg font-semibold text-primary">
                     Rent Page SEO & Content
                   </h3>
                   <p className="text-sm text-blue-500">
@@ -288,7 +288,7 @@ export default function AddAreaPage() {
                     name="rentMetaTitle"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel className="text-blue-700">
+                        <FormLabel className="text-primary">
                           Rent Meta Title
                         </FormLabel>
                         <FormControl>
@@ -307,7 +307,7 @@ export default function AddAreaPage() {
                     name="rentMetaDescription"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel className="text-blue-700">
+                        <FormLabel className="text-primary">
                           Rent Meta Description
                         </FormLabel>
                         <FormControl>
@@ -327,7 +327,7 @@ export default function AddAreaPage() {
                   name="rentContent"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel className="text-blue-700">
+                      <FormLabel className="text-primary">
                         Rent Content (Rich Text)
                       </FormLabel>
                       <FormControl>

@@ -92,14 +92,14 @@ export default function HomeHowItWorks() {
             ))}
             {/* the end of the path: the key */}
             <li className="flex items-center gap-3.5 sm:flex-col sm:items-start sm:gap-3">
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-[var(--price-tag)] text-white shadow-[0_0_0_6px_rgba(234,88,12,0.2)]">
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-[var(--price-tag)] text-white shadow-[0_0_0_6px_rgba(255,255,255,0.12)]">
                 <KeyRound className="h-5 w-5" />
               </span>
               <span>
                 <span className="block text-[15px] font-bold leading-snug">{j.end}</span>
                 <Link
                   href={j.cta.href}
-                  className="mt-2 inline-flex h-9 items-center rounded-full bg-white px-4 text-[13px] font-bold text-navy transition-colors hover:bg-[#ecfdf8]"
+                  className="mt-2 inline-flex h-9 items-center rounded-full bg-white px-4 text-[13px] font-bold text-navy transition-colors hover:bg-accent"
                 >
                   {j.cta.label}
                 </Link>

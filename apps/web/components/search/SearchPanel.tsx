@@ -120,6 +120,59 @@ function Beds({ value, onChange }: { value?: number; onChange: (v?: number) => v
   );
 }
 
+/** One tap per choice — the phone sheet's way of picking type, budget and size. */
+function Chips<T extends string>({
+  label,
+  options,
+  isOn,
+  onPick,
+}: {
+  label: string;
+  options: { key: T; label: string }[];
+  isOn: (key: T) => boolean;
+  onPick: (key: T) => void;
+}) {
+  return (
+    <div>
+      <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">{label}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o.key}
+            type="button"
+            aria-pressed={isOn(o.key)}
+            onClick={() => onPick(o.key)}
+            className={cn(
+              'h-9 rounded-full border px-3.5 text-[13px] font-semibold transition-colors',
+              isOn(o.key) ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300',
+            )}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Monthly budgets people actually search by. */
+const BUDGET_CHIPS: { key: string; label: string; min?: number; max?: number }[] = [
+  { key: 'any', label: 'Any' },
+  { key: 'u25', label: 'Under 25k', max: 25_000 },
+  { key: '25-50', label: '25k – 50k', min: 25_000, max: 50_000 },
+  { key: '50-100', label: '50k – 1 Lakh', min: 50_000, max: 100_000 },
+  { key: '100-200', label: '1 – 2 Lakh', min: 100_000, max: 200_000 },
+  { key: '200+', label: '2 Lakh+', min: 200_000 },
+];
+const SIZE_CHIPS: { key: string; label: string; marla?: number }[] = [
+  { key: 'any', label: 'Any' },
+  { key: '3', label: '3 Marla', marla: 3 },
+  { key: '5', label: '5 Marla', marla: 5 },
+  { key: '7', label: '7 Marla', marla: 7 },
+  { key: '10', label: '10 Marla', marla: 10 },
+  { key: '20', label: '1 Kanal', marla: 20 },
+];
+
 /** Where: an area of the chosen city — typed or picked. */
 function LocationPicker({
   places,
@@ -349,37 +402,137 @@ export default function SearchPanel({
   );
   const clearExtras = () => set({ priceMin: undefined, priceMax: undefined, marlaMin: undefined, marlaMax: undefined, beds: undefined, search: undefined });
 
-  /** Every field, stacked — the phone sheet. */
+  /** Every field, stacked — the phone sheet. Choices are tap chips, not dropdowns. */
+  const budgetKey = BUDGET_CHIPS.find((c) => (c.min ?? undefined) === s.priceMin && (c.max ?? undefined) === s.priceMax)?.key ?? (s.priceMin || s.priceMax ? '' : 'any');
+  const sizeKey = s.marlaMin && s.marlaMin === s.marlaMax ? SIZE_CHIPS.find((c) => c.marla === s.marlaMin)?.key ?? '' : s.marlaMin || s.marlaMax ? '' : 'any';
   const fullForm = (
-    <div className="space-y-4">
-      <div>
-        <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">City</p>
-        {citySelect}
+    <div className="space-y-5">
+      <div className="grid gap-3">
+        <div>
+          <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">City</p>
+          {citySelect}
+        </div>
+        <div>
+          <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">Area</p>
+          {location}
+        </div>
       </div>
-      <div>
-        <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">Location</p>
-        {location}
-      </div>
-      <div>
-        <p className="mb-1.5 text-[12.5px] font-semibold text-slate-700">Property type</p>
-        {typeSelect}
-      </div>
-      {priceRange}
-      {sizeRange}
+      <Chips
+        label="What to rent"
+        options={[{ key: '', label: 'All' }, ...typeOptions.map((t) => ({ key: t, label: TYPE_LABELS[t] ?? toTitleCase(t) }))]}
+        isOn={(k) => (s.type || '') === k}
+        onPick={(k) => set({ type: k, ...(NO_BEDS.includes(k) ? { beds: undefined } : {}) })}
+      />
+      <Chips
+        label="Monthly budget"
+        options={BUDGET_CHIPS.map(({ key, label }) => ({ key, label }))}
+        isOn={(k) => budgetKey === k}
+        onPick={(k) => {
+          const c = BUDGET_CHIPS.find((x) => x.key === k)!;
+          set({ priceMin: c.min, priceMax: c.max });
+        }}
+      />
+      <Chips
+        label="Size"
+        options={SIZE_CHIPS.map(({ key, label }) => ({ key, label }))}
+        isOn={(k) => sizeKey === k}
+        onPick={(k) => {
+          const c = SIZE_CHIPS.find((x) => x.key === k)!;
+          set({ marlaMin: c.marla, marlaMax: c.marla });
+        }}
+      />
       {showBeds && <Beds value={s.beds} onChange={(b) => set({ beds: b })} />}
-      {keyword}
+      <details className="group rounded-xl border border-slate-200 px-3 py-2">
+        <summary className="flex cursor-pointer list-none items-center justify-between text-[13px] font-semibold text-slate-700">
+          Exact rent, size or a keyword
+          <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="mt-3 space-y-4 pb-1">
+          {priceRange}
+          {sizeRange}
+          {keyword}
+        </div>
+      </details>
     </div>
+  );
+
+  const where = [s.areaSlug ? toTitleCase(places.find((p) => p.slug === s.areaSlug)?.name ?? s.areaSlug.replace(/-/g, ' ')) : '', city ? toTitleCase(city.name) : ''].filter(Boolean).join(', ');
+
+  /** The phone sheet, shared by the homepage and the results pages. */
+  const sheetEl = (
+    <Sheet open={sheet} onOpenChange={setSheet}>
+      <SheetContent side="bottom" className="z-[80] flex h-[90dvh] flex-col gap-0 rounded-t-3xl p-0 lg:hidden [&>button.absolute]:hidden">
+        <div className="mx-auto mt-2 h-1.5 w-10 rounded-full bg-slate-200" aria-hidden />
+        <div className="flex items-center justify-between px-4 pb-2 pt-2">
+          <SheetTitle className="text-[17px] font-bold">Find a rental</SheetTitle>
+          <button type="button" onClick={() => setSheet(false)} aria-label="Close" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <form
+          id="search-sheet"
+          onSubmit={(e) => {
+            e.preventDefault();
+            go();
+          }}
+          className="flex-1 overflow-y-auto px-4 pb-4 pt-1"
+        >
+          {fullForm}
+        </form>
+        <div className="flex gap-2 border-t bg-white px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
+          <button type="button" onClick={() => setS({ ...EMPTY_SEARCH, purpose: s.purpose, citySlug: s.citySlug })} className="h-12 flex-1 rounded-2xl border border-slate-200 text-[14px] font-semibold text-slate-700">
+            Clear
+          </button>
+          <button type="submit" form="search-sheet" className="inline-flex h-12 flex-[2] items-center justify-center gap-2 rounded-2xl bg-primary text-[15px] font-bold text-white">
+            <Search className="h-4 w-4" /> Show rentals
+          </button>
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 
   // ── Homepage card ──
   if (variant === 'hero') {
     return (
+      <>
+      {/* Phones: quick types, then one search bar that opens the sheet. */}
+      <div className="mt-4 rounded-3xl bg-white p-2 shadow-[0_24px_60px_-24px_rgba(0,0,0,0.5)] lg:hidden">
+        <div className="hide-scrollbar flex gap-1.5 overflow-x-auto pb-2">
+          {([['', 'All'], ['house', 'House'], ['upper-portion', 'Upper portion'], ['lower-portion', 'Lower portion'], ['flat', 'Flat'], ['room', 'Room'], ['shop', 'Shop']] as [string, string][]).map(([v, label]) => (
+            <button
+              key={v || 'all'}
+              type="button"
+              aria-pressed={(s.type || '') === v}
+              onClick={() => set({ type: v })}
+              className={cn('h-8 shrink-0 whitespace-nowrap rounded-full px-3 text-[12.5px] font-semibold', (s.type || '') === v ? 'bg-primary text-white' : 'bg-slate-100 text-slate-600')}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => setSheet(true)} className="flex h-12 min-w-0 flex-1 items-center gap-2.5 rounded-2xl bg-slate-100 px-3.5 text-left">
+            <MapPin className="h-[18px] w-[18px] shrink-0 text-primary" />
+            <span className="min-w-0">
+              <span className="block truncate text-[14px] font-semibold text-slate-900">{where || 'Choose a city'}</span>
+              <span className="block truncate text-[11.5px] text-slate-500">
+                {[s.type ? TYPE_LABELS[s.type] ?? toTitleCase(s.type) : 'Any type', extras ? `${extras} filter${extras > 1 ? 's' : ''}` : 'Area, budget, size'].join(' · ')}
+              </span>
+            </span>
+            <SlidersHorizontal className="ml-auto h-4 w-4 shrink-0 text-slate-500" />
+          </button>
+          <button type="button" onClick={() => go()} aria-label="Search" className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-primary text-white">
+            <Search className="h-5 w-5" />
+          </button>
+        </div>
+      </div>
+      {sheetEl}
       <form
         onSubmit={(e) => {
           e.preventDefault();
           go();
         }}
-        className="mx-auto mt-5 max-w-5xl rounded-3xl bg-white p-1.5 text-left shadow-[0_24px_60px_-24px_rgba(0,0,0,0.5)] sm:mt-7"
+        className="mx-auto mt-7 hidden max-w-5xl rounded-3xl bg-white p-1.5 text-left shadow-[0_24px_60px_-24px_rgba(0,0,0,0.5)] lg:block"
       >
         {/* Rentals only — quick picks for the commonest types instead of Buy / Rent tabs. */}
         <div className="flex gap-1.5 overflow-x-auto px-1.5 pb-1 pt-1.5 [scrollbar-width:none]">
@@ -439,54 +592,32 @@ export default function SearchPanel({
           </div>
         </div>
       </form>
+      </>
     );
   }
 
   // ── Results pages ──
-  const where = [s.areaSlug ? toTitleCase(places.find((p) => p.slug === s.areaSlug)?.name ?? s.areaSlug.replace(/-/g, ' ')) : '', city ? toTitleCase(city.name) : ''].filter(Boolean).join(', ');
 
   return (
     <section className="relative z-40 border-b border-slate-200/70 bg-white lg:sticky lg:top-14">
       {/* Phone & tablet: where, Filters. */}
       <div className="container mx-auto flex items-center gap-2 px-[var(--gutter)] py-2 sm:px-4 lg:hidden">
-        <button type="button" onClick={() => setSheet(true)} className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-full bg-slate-100 px-4 text-left">
-          <Search className="h-4 w-4 shrink-0 text-slate-400" />
-          <span className={cn('truncate text-[14px]', where ? 'font-medium text-slate-900' : 'text-slate-400')}>{where || 'City or area'}</span>
+        <button type="button" onClick={() => setSheet(true)} className="flex h-11 min-w-0 flex-1 items-center gap-2.5 rounded-2xl bg-slate-100 px-3.5 text-left">
+          <Search className="h-4 w-4 shrink-0 text-slate-500" />
+          <span className="min-w-0">
+            <span className={cn('block truncate text-[13.5px] leading-tight', where ? 'font-semibold text-slate-900' : 'text-slate-500')}>{where || 'City or area'}</span>
+            <span className="block truncate text-[11px] leading-tight text-slate-500">
+              {[s.type ? TYPE_LABELS[s.type] ?? toTitleCase(s.type) : 'Any type', s.priceMin || s.priceMax ? rangeLabel(s.priceMin, s.priceMax, priceLabel) : 'Any rent'].join(' · ')}
+            </span>
+          </span>
         </button>
-        <button type="button" onClick={() => setSheet(true)} className="relative grid h-10 w-10 shrink-0 place-items-center rounded-full bg-slate-900 text-white" aria-label="Filters">
+        <button type="button" onClick={() => setSheet(true)} className="relative grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-primary text-white" aria-label="Filters">
           <SlidersHorizontal className="h-[18px] w-[18px]" />
-          {extras + (s.type ? 1 : 0) > 0 && <span className="absolute -right-1.5 -top-1.5 grid h-5 min-w-5 place-items-center rounded-full bg-primary px-1 text-[11px] font-bold text-white">{extras + (s.type ? 1 : 0)}</span>}
+          {extras + (s.type ? 1 : 0) > 0 && <span className="absolute -right-1.5 -top-1.5 grid h-5 min-w-5 place-items-center rounded-full bg-slate-900 px-1 text-[11px] font-bold text-white ring-2 ring-white">{extras + (s.type ? 1 : 0)}</span>}
         </button>
       </div>
 
-      <Sheet open={sheet} onOpenChange={setSheet}>
-        <SheetContent side="bottom" className="flex h-[92dvh] flex-col gap-0 rounded-t-2xl p-0 lg:hidden [&>button.absolute]:hidden">
-          <div className="flex items-center justify-between border-b px-4 py-3.5">
-            <SheetTitle className="text-[16px] font-bold">Search rentals</SheetTitle>
-            <button type="button" onClick={() => setSheet(false)} aria-label="Close" className="grid h-9 w-9 place-items-center rounded-lg text-slate-500 hover:bg-slate-100">
-              <X className="h-5 w-5" />
-            </button>
-          </div>
-          <form
-            id="search-sheet"
-            onSubmit={(e) => {
-              e.preventDefault();
-              go();
-            }}
-            className="flex-1 overflow-y-auto px-4 py-4"
-          >
-            {fullForm}
-          </form>
-          <div className="flex gap-2 border-t bg-white px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
-            <button type="button" onClick={() => setS({ ...EMPTY_SEARCH, purpose: s.purpose, citySlug: s.citySlug })} className="h-11 flex-1 rounded-xl border border-slate-200 text-[14px] font-semibold text-slate-700">
-              Reset
-            </button>
-            <button type="submit" form="search-sheet" className="h-11 flex-[2] rounded-xl bg-primary text-[14px] font-semibold text-white">
-              Show results
-            </button>
-          </div>
-        </SheetContent>
-      </Sheet>
+      {sheetEl}
 
       {/* Desktop: one row. */}
       <form

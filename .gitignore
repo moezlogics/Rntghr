@@ -86,3 +86,7 @@ api@*
 /uploads/
 /private-uploads/
 
+
+# Live server secrets and the database export — never committed
+/deploy/live-env/
+/deploy/*.json.gz

@@ -42,9 +42,9 @@ export default function HomeRentTypes() {
               <Link
                 key={slug}
                 href={`/properties/rent/${slug}`}
-                className="group relative flex w-[118px] shrink-0 snap-start flex-col overflow-hidden rounded-[20px] bg-white ring-1 ring-slate-200/80 transition-[box-shadow,transform] hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-18px_rgba(11,59,58,0.55)] hover:ring-primary/30 sm:w-auto"
+                className="group relative flex w-[118px] shrink-0 snap-start flex-col overflow-hidden rounded-[20px] bg-white ring-1 ring-slate-200/80 transition-[box-shadow,transform] hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-18px_rgba(15,23,42,0.35)] hover:ring-primary/30 sm:w-auto"
               >
-                <span className="relative grid h-[84px] place-items-center bg-[linear-gradient(180deg,#ecfdf8_0%,#ffffff_100%)] text-[#0b3b3a]">
+                <span className="relative grid h-[84px] place-items-center bg-[linear-gradient(180deg,var(--accent)_0%,#ffffff_100%)] text-navy">
                   <Art className="h-[60px] w-[68px] transition-transform duration-300 group-hover:scale-110" />
                 </span>
                 <span className="px-3 pb-3 pt-2">

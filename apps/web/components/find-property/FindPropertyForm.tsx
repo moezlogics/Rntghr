@@ -371,7 +371,7 @@ export default function FindPropertyForm() {
           </div>
         </div>
         <label className="flex cursor-pointer items-center gap-2 text-[14.5px] text-slate-700">
-          <input type="checkbox" checked={whatsapp} onChange={(e) => setWhatsapp(e.target.checked)} className="h-4 w-4 accent-[var(--color-primary,#0f766e)]" />
+          <input type="checkbox" checked={whatsapp} onChange={(e) => setWhatsapp(e.target.checked)} className="h-4 w-4 accent-[var(--color-primary,var(--primary))]" />
           This number is on WhatsApp
         </label>
         {/* Hidden from people; bots fill it in. */}

@@ -11,7 +11,9 @@
     "check-types": "turbo run check-types",
     "seed:packages": "curl -X POST http://localhost:3105/api/packages/seed",
     "seed:local": "node scripts/seed-local.js",
-    "seed:rentals": "node scripts/scrape-and-seed.js"
+    "seed:rentals": "node scripts/scrape-and-seed.js",
+    "db:export": "node scripts/db/export-local.js",
+    "db:import": "node scripts/db/import-live.js"
   },
   "devDependencies": {
     "@next/bundle-analyzer": "^16.2.9",

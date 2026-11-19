@@ -143,12 +143,12 @@ const Navbar = () => {
       )}
 
     {/*
-      Frosted white, 56px tall — the sticky bars below it line up on that
+      Solid white, 56px tall — the sticky bars below it line up on that
       height (top-14).
     */}
     <header
       className={cn(
-        'sticky top-0 z-50 border-b border-slate-200/70 bg-white/85 backdrop-blur-md supports-[backdrop-filter]:bg-white/75',
+        'sticky top-0 z-50 border-b border-slate-200 bg-white',
         immersive && 'max-md:hidden',
       )}
     >

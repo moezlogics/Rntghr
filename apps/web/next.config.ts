@@ -93,8 +93,8 @@ const nextConfig: NextConfig = {
     }
     
     if (!baseUrl) {
-      // Fallback: PM2 runs the Rent Ghar API on 5100 in production, dev runs on 3105
-      baseUrl = process.env.NODE_ENV === 'production' ? 'http://localhost:5100' : 'http://localhost:3105';
+      // Fallback: PM2 runs the Rent Ghar API on 3118 in production, dev runs on 3105
+      baseUrl = process.env.NODE_ENV === 'production' ? 'http://127.0.0.1:3118' : 'http://localhost:3105';
     }
 
     console.log(`📡 Rewriting /api and /uploads to: ${baseUrl}`);

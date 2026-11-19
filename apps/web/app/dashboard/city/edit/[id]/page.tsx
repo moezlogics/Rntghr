@@ -539,7 +539,7 @@ export default function EditCityPage() {
                       name="rentMetaTitle"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel className="text-blue-600 font-medium">
+                          <FormLabel className="text-primary font-medium">
                             Rent Meta Title (SEO)
                           </FormLabel>
                           <FormControl>
@@ -558,7 +558,7 @@ export default function EditCityPage() {
                       name="rentMetaDescription"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel className="text-blue-600 font-medium">
+                          <FormLabel className="text-primary font-medium">
                             Rent Meta Description (SEO)
                           </FormLabel>
                           <FormControl>
@@ -578,7 +578,7 @@ export default function EditCityPage() {
                     name="rentContent"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel className="text-blue-600 font-medium">
+                        <FormLabel className="text-primary font-medium">
                           Rent Content (Rich Text)
                         </FormLabel>
                         <FormControl>

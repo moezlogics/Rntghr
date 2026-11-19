@@ -8,14 +8,14 @@ import { cn } from "@/lib/utils";
 export type StatTone = "neutral" | "success" | "warning" | "danger" | "info";
 
 const TONE_STYLES: Record<StatTone, { icon: string; value: string }> = {
-  neutral: { icon: "bg-[#ecfdf8] text-primary", value: "text-slate-900" },
+  neutral: { icon: "bg-accent text-primary", value: "text-slate-900" },
   success: {
     icon: "bg-emerald-50 text-emerald-600",
     value: "text-emerald-700",
   },
   warning: { icon: "bg-amber-50 text-amber-600", value: "text-amber-700" },
   danger: { icon: "bg-red-50 text-red-600", value: "text-red-700" },
-  info: { icon: "bg-[#ecfdf8] text-primary", value: "text-primary" },
+  info: { icon: "bg-accent text-primary", value: "text-primary" },
 };
 
 interface StatCardProps {
