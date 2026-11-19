@@ -1,0 +1,122 @@
+ import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  images: {
+    formats: ['image/avif', 'image/webp'],
+    minimumCacheTTL: 60 * 60 * 24 * 60,
+    // The same widths the API's /img makes (lib/img.ts), so every srcset entry is one cached file.
+    deviceSizes: [480, 640, 828, 1080, 1280, 1600],
+    imageSizes: [96, 160, 256, 384],
+    remotePatterns: [
+      { protocol: 'https', hostname: 'images.unsplash.com' },
+      { protocol: 'https', hostname: 'placehold.co' },
+      { protocol: 'http',  hostname: 'localhost' },
+      { protocol: 'https', hostname: 'plus.unsplash.com' },
+      { protocol: 'https', hostname: 'ptcptourism.com' },
+      { protocol: 'https', hostname: 'upload.wikimedia.org' },
+      { protocol: 'https', hostname: 'english.news.cn' },
+      { protocol: 'https', hostname: 'rentghar.pk' },
+    ],
+  },
+
+  experimental: {
+    optimizePackageImports: ['lucide-react', '@radix-ui/react-icons'],
+    optimizeCss: true,
+    // How long the browser reuses a page it already fetched while you click
+    // around. Next's default is 5 minutes, so an edit saved in the dashboard
+    // still looked unchanged on the site; 30 seconds is the shortest allowed.
+    staleTimes: { dynamic: 0, static: 30 },
+  },
+
+  compress: true,
+
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          { key: 'X-DNS-Prefetch-Control',   value: 'on' },
+          { key: 'Strict-Transport-Security', value: 'max-age=63072000; includeSubDomains; preload' },
+          { key: 'X-Frame-Options',           value: 'SAMEORIGIN' },
+          { key: 'X-Content-Type-Options',    value: 'nosniff' },
+          { key: 'X-XSS-Protection',          value: '1; mode=block' },
+          { key: 'Referrer-Policy',           value: 'origin-when-cross-origin' },
+          /*
+           * geolocation=(self), not ().
+           *
+           * () blocks it outright, including for our own pages — so the "I'm
+           * here" button on the map picker threw "Permissions policy
+           * violation: Geolocation access has been blocked" and did nothing.
+           * (self) keeps it off for embedded third parties and lets our own
+           * page ask, which the browser still gates behind the user's own
+           * permission prompt.
+           */
+          { key: 'Permissions-Policy',        value: 'camera=(), microphone=(), geolocation=(self)' },
+        ],
+      },
+      {
+        source: '/_next/static/:path*',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=31536000, immutable' },
+        ],
+      },
+    ];
+  },
+
+  async redirects() {
+    return [
+      // One address per city's dealers page: the folder path redirects to the readable one.
+      { source: '/property-dealers/:city([a-z0-9-]+)', destination: '/property-dealers-in-:city', permanent: true },
+      // Rent Ghar lists rentals only: every search lives under /properties/rent.
+      { source: '/properties', destination: '/properties/rent', permanent: true },
+      {
+        source: '/properties/all/:city',
+        has: [{ type: 'query', key: 'type', value: '(?<ptype>[a-z-]{2,30})' }],
+        destination: '/properties/rent/:city/:ptype',
+        permanent: true,
+      },
+      { source: '/properties/all', destination: '/properties/rent', permanent: true },
+      { source: '/properties/all/:path*', destination: '/properties/rent/:path*', permanent: true },
+    ];
+  },
+
+  async rewrites() {
+    // 📡 Determine the correct NestJS API URL.
+    // ⚠️ CRITICAL: DO NOT proxy to the web app itself or the public domain (rentghar.pk) as it causes infinite proxy loops.
+    let baseUrl = process.env.INTERNAL_API_URL;
+    
+    if (!baseUrl) {
+      const publicUrl = process.env.NEXT_PUBLIC_API_URL;
+      if (publicUrl && !publicUrl.includes('rentghar.pk') && !publicUrl.includes('localhost:3110')) {
+        baseUrl = publicUrl;
+      }
+    }
+    
+    if (!baseUrl) {
+      // Fallback: PM2 runs the Rent Ghar API on 5100 in production, dev runs on 3105
+      baseUrl = process.env.NODE_ENV === 'production' ? 'http://localhost:5100' : 'http://localhost:3105';
+    }
+
+    console.log(`📡 Rewriting /api and /uploads to: ${baseUrl}`);
+    return {
+      beforeFiles: [
+        // ✅ Sitemap XML rewrites
+        { source: '/sitemap-pages.xml',      destination: '/sitemap-pages'      },
+        { source: '/sitemap-areas.xml',      destination: '/sitemap-areas'      },
+        { source: '/sitemap-blogs.xml',      destination: '/sitemap-blogs'      },
+        { source: '/sitemap-properties.xml', destination: '/sitemap-properties' },
+        // A city's property dealers: /property-dealers-in-lahore (app/(pages)/property-dealers/[city]).
+        { source: '/property-dealers-in-:city([a-z0-9-]+)', destination: '/property-dealers/:city' },
+      ],
+      afterFiles: [
+        { source: '/api/:path*',     destination: `${baseUrl}/api/:path*`     },
+        { source: '/uploads/:path*', destination: `${baseUrl}/uploads/:path*` },
+        // Resized photos (see lib/img.ts): made once by the API, then cached by Cloudflare.
+        { source: '/img/:path*',     destination: `${baseUrl}/img/:path*`     },
+      ],
+      fallback: [],
+    };
+  },
+};
+
+export default nextConfig;

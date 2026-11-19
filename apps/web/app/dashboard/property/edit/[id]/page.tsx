@@ -1,0 +1,1213 @@
+"use client";
+
+import { refreshListing } from "@/app/actions/refresh-cache";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useParams } from "next/navigation";
+import { toast } from "sonner";
+import { GalleryField, VideoField } from "@/components/media";
+import { subscriptionApi } from "@/lib/api";
+import {
+  AreaSizeField,
+  FeaturesPicker,
+  PriceField,
+} from "@/components/dashboard";
+import { Loader2, Plus } from "lucide-react";
+import { toTitleCase } from "@/lib/utils";
+import { marlaKanalFor } from "@/lib/pk";
+import { NO_BEDS } from "@/lib/search";
+import { useAuth } from "@/context/auth-context";
+import { propertyApi, getAccessToken } from "@/lib/api";
+import cityApi from "@/lib/api/city/city.api";
+import areaApi from "@/lib/api/area/area.api";
+
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+import { Button } from "@/components/ui/button";
+
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+import dynamic from "next/dynamic";
+import { CityPicker } from "@/components/ui/city-picker";
+const RichEditor = dynamic(() => import("@/components/RichEditor"), {
+  ssr: false,
+  loading: () => (
+    <div className="h-[200px] w-full bg-gray-100 animate-pulse rounded-lg flex items-center justify-center text-gray-400">
+      Loading Editor...
+    </div>
+  ),
+});
+
+const MapPicker = dynamic(() => import("@/components/MapPicker"), {
+  ssr: false,
+  loading: () => (
+    <div className="h-[300px] w-full bg-gray-100 animate-pulse rounded-lg flex items-center justify-center text-gray-400">
+      Loading Map...
+    </div>
+  ),
+});
+
+interface City {
+  _id: string;
+  name: string;
+  state: string;
+  country: string;
+  /** Square feet in one marla here; 225 when unset. */
+  marlaSqft?: number;
+}
+
+interface Area {
+  _id: string;
+  name: string;
+  city: string | City;
+}
+
+export default function EditProperty() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
+  const router = useRouter();
+  const [isLoading, setIsLoading] = useState(false);
+
+  // On the market: rented / available, and featured — saved at once, apart from the form.
+  const [availability, setAvailabilityState] = useState<"available" | "rented">("available");
+  const [featured, setFeatured] = useState(false);
+  const [listingSlug, setListingSlug] = useState("");
+  const [marketBusy, setMarketBusy] = useState(false);
+
+  // Form state
+  const [listingType, setListingType] = useState<"rent">("rent");
+  const [propertyType, setPropertyType] = useState("");
+  /*
+   * Location is derived, not assigned.
+   *
+   * Three times now this form has opened on a live listing showing "Select
+   * city" / "Select city first", and saving from that screen wrote the empty
+   * selection back. Every attempt to fix it by getting the setState order
+   * right failed, because the design was the problem: the listing's own
+   * location existed only as whatever was left in two string states after
+   * three fetches and four setters had raced.
+   *
+   * So it is not stored in those states any more. `loadedArea` holds the
+   * area exactly as the API returned it — one assignment, no race — and the
+   * ids below are computed from it. A choice state starts null, meaning "the
+   * person has not touched this control", and only once they do does their
+   * pick take over. There is no sequence of events that can empty this while
+   * the listing has an area, because nothing ever writes to it.
+   */
+  const [loadedArea, setLoadedArea] = useState<Area | null>(null);
+  const [cityChoice, setCityChoice] = useState<string | null>(null);
+  const [areaChoice, setAreaChoice] = useState<string | null>(null);
+
+  const loadedCity =
+    loadedArea && typeof loadedArea.city === "object"
+      ? (loadedArea.city as City)
+      : null;
+
+  const cityId = cityChoice ?? (loadedCity ? String(loadedCity._id) : "");
+  const areaId = areaChoice ?? (loadedArea ? String(loadedArea._id) : "");
+
+  const setCityId = setCityChoice;
+  const setAreaId = setAreaChoice;
+  const [title, setTitle] = useState("");
+  const [location, setLocation] = useState("");
+  const [bedrooms, setBedrooms] = useState("");
+  const [bathrooms, setBathrooms] = useState("");
+  // Shops, offices and warehouses have no bedrooms or bathrooms.
+  const noRooms = NO_BEDS.includes(propertyType.toLowerCase());
+  const [areaSize, setAreaSize] = useState(""); // Property size in sq ft
+  const [price, setPrice] = useState("");
+  const [description, setDescription] = useState("");
+  const [contactNumber, setContactNumber] = useState("");
+  const [whatsappNumber, setWhatsappNumber] = useState("");
+  const [latitude, setLatitude] = useState<number | undefined>();
+  const [longitude, setLongitude] = useState<number | undefined>();
+
+  // Cities and Areas state
+  const [cities, setCities] = useState<City[]>([]);
+  const [areas, setAreas] = useState<Area[]>([]);
+
+  const [loadingProperty, setLoadingProperty] = useState(true);
+  const [loadingAreas, setLoadingAreas] = useState(false);
+  const [showAddCityModal, setShowAddCityModal] = useState(false);
+  const [showAddAreaModal, setShowAddAreaModal] = useState(false);
+  const [newCityName, setNewCityName] = useState("");
+  const [newAreaName, setNewAreaName] = useState("");
+  const [isAddingLocation, setIsAddingLocation] = useState(false);
+
+  // Photos in display order; the first is the cover. Already-uploaded URLs,
+  // so there are no File objects to carry around.
+  const [photos, setPhotos] = useState<string[]>([]);
+  // Photos per listing on the plan; a listing that already has more keeps them.
+  const [photoLimit, setPhotoLimit] = useState(20);
+  useEffect(() => {
+    subscriptionApi
+      .getMyPlan()
+      .then((p) => setPhotoLimit(p?.perks.photosPerProperty || 20))
+      .catch(() => undefined);
+  }, []);
+  // One short walkthrough clip, shown as the last slide of the gallery.
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoPosterUrl, setVideoPosterUrl] = useState("");
+
+  const [features, setFeatures] = useState<string[]>([""]);
+
+  // Track existing status so we can offer publish-from-draft semantics in the
+  // submit buttons. Possible values match the backend: pending|approved|rejected|draft.
+  const [currentStatus, setCurrentStatus] = useState<
+    "pending" | "approved" | "rejected" | "draft" | undefined
+  >(undefined);
+
+  /*
+   * What the listing arrived with, so an edit that does not touch the size
+   * leaves its marla/kanal exactly as they were. Some older rows carry a
+   * hand-entered marla that does not match their square footage, and quietly
+   * recomputing it would move the listing between size filters.
+   */
+  const [originalSize, setOriginalSize] = useState<{
+    areaSize: string;
+    marla?: number;
+    kanal?: number;
+    marlaSqft: number;
+  } | null>(null);
+
+  /** Set when the listing's saved city/area could not be resolved. */
+  const [locationUnresolved, setLocationUnresolved] = useState(false);
+
+  const params = useParams();
+  const propertyId = params.id as string;
+
+  // Fetch cities on component mount
+  useEffect(() => {
+    const fetchCities = async () => {
+      try {
+        const data = await cityApi.getNames();
+        setCities((prev) => {
+          // Merge fetched cities with existing (which might have our seeded city)
+          const newCities = [...prev];
+          data.forEach((city: any) => {
+            if (!newCities.find((c) => String(c._id) === String(city._id))) {
+              newCities.push(city);
+            }
+          });
+          return newCities;
+        });
+      } catch (error: any) {
+        console.error("Error fetching cities:", error);
+        toast.error("Error", {
+          description: "Failed to load cities. Please try again.",
+        });
+      }
+    };
+    fetchCities();
+  }, []);
+
+  /**
+   * Put the listing's own city and area back into the two dropdowns, whatever
+   * shape the API returned them in, and seed the lists with them so they are
+   * selectable even if they are missing from the fetched options (an
+   * deactivated city, a long list, a failed request).
+   */
+  const restoreLocation = async (areaValue: unknown) => {
+    if (!areaValue) {
+      setLocationUnresolved(true);
+      return;
+    }
+
+    try {
+      let areaObj: any =
+        typeof areaValue === "object" ? (areaValue as any) : null;
+
+      // Shape 3: only an id — ask for the area itself.
+      if (!areaObj) {
+        areaObj = await areaApi.getById(String(areaValue));
+      }
+
+      if (!areaObj?._id) {
+        setLocationUnresolved(true);
+        return;
+      }
+
+      const areaIdStr = String(areaObj._id);
+      setAreas((prev) =>
+        prev.some((a) => String(a._id) === areaIdStr) ? prev : [...prev, areaObj],
+      );
+
+      let cityObj: any =
+        areaObj.city && typeof areaObj.city === "object" ? areaObj.city : null;
+
+      // Shape 2: the city came back as an id.
+      if (!cityObj && areaObj.city) {
+        try {
+          cityObj = await cityApi.getById(String(areaObj.city));
+        } catch {
+          // Fall through to using the bare id: the city list almost certainly
+          // contains it, and the selection still saves correctly.
+          setCityId(String(areaObj.city));
+        }
+      }
+
+      if (cityObj?._id) {
+        const cityIdStr = String(cityObj._id);
+        setCities((prev) =>
+          prev.some((c) => String(c._id) === cityIdStr) ? prev : [...prev, cityObj],
+        );
+      } else if (!areaObj.city) {
+        setLocationUnresolved(true);
+      }
+
+      /*
+       * The one write that matters, and it happens last: the area with its
+       * city attached, whichever of the three shapes it arrived in. Both
+       * dropdowns read from this.
+       */
+      setLoadedArea({ ...areaObj, city: cityObj ?? areaObj.city } as Area);
+    } catch (error) {
+      console.error("Could not restore the listing's location:", error);
+      setLocationUnresolved(true);
+    }
+  };
+
+  // Fetch property data
+  useEffect(() => {
+    const fetchProperty = async (propertyId: string) => {
+      try {
+        setLoadingProperty(true);
+        const property = await propertyApi.getPropertyById({ id: propertyId });
+
+        setListingType("rent");
+
+        // Map backend lowercase type to capitalized frontend type
+        const typeMapping: Record<string, string> = {
+          house: "House",
+          "upper-portion": "Upper Portion",
+          "lower-portion": "Lower Portion",
+          flat: "Flat",
+          apartment: "Apartment",
+          room: "Room",
+          hostel: "Hostel",
+          shop: "Shop",
+          office: "Office",
+          warehouse: "Warehouse",
+          commercial: "Commercial",
+        };
+        setPropertyType(typeMapping[property.propertyType] || "House");
+
+        /*
+         * Restore the city and area this listing already has.
+         *
+         * Three shapes turn up here and all three have to end with both
+         * dropdowns filled in, because a save writes whatever they hold:
+         *   1. area populated with its city populated  — the normal case
+         *   2. area populated, city still an id        — resolve the city
+         *   3. area is just an id                      — fetch the area first
+         *
+         * Anything left unresolved raises the banner below instead of quietly
+         * showing two empty dropdowns, which is how a published listing could
+         * lose its location on an unrelated edit.
+         */
+        await restoreLocation(property.area);
+
+        setTitle(property.title);
+        setAvailabilityState((property.availability as "available" | "rented") || "available");
+        setFeatured(Boolean(property.isFeatured));
+        setListingSlug(property.status === "approved" ? property.slug ?? "" : "");
+        setLocation(property.location);
+        setBedrooms(property.bedrooms?.toString() || "0");
+        setBathrooms(property.bathrooms?.toString() || "0");
+        setAreaSize(property.areaSize?.toString() || "0");
+        setOriginalSize({
+          areaSize: property.areaSize?.toString() || "0",
+          marla: property.marla,
+          kanal: property.kanal,
+          marlaSqft: Number((property as { marlaSqft?: number }).marlaSqft) || 225,
+        });
+        setPrice(property.price?.toString() || "0");
+        setDescription(property.description || "");
+        setContactNumber(property.contactNumber || "");
+        setWhatsappNumber(property.whatsappNumber || "");
+        setLatitude(property.latitude);
+        setLongitude(property.longitude);
+
+        // Correct field names for images
+        setVideoUrl(property.videoUrl ?? "");
+        setVideoPosterUrl(property.videoPosterUrl ?? "");
+
+        setPhotos(
+          [property.mainPhotoUrl, ...(property.additionalPhotosUrls ?? [])].filter(
+            (url): url is string => Boolean(url),
+          ),
+        );
+
+        setFeatures(
+          property.features && property.features.length > 0
+            ? property.features
+            : [""],
+        );
+        setCurrentStatus(property.status);
+      } catch (error: any) {
+        console.error("Error fetching property:", error);
+        toast.error("Error", {
+          description: "Failed to load property. Please try again.",
+        });
+      } finally {
+        setLoadingProperty(false);
+      }
+    };
+    if (propertyId) {
+      fetchProperty(propertyId);
+    }
+  }, [propertyId]);
+
+  useEffect(() => {
+    const fetchAreas = async () => {
+      if (!cityId) {
+        // Keep the listing's own area in the list: clearing it here is what made
+        // an edit open with an empty Area dropdown before the city resolved.
+        if (!areaId) setAreas([]);
+        return;
+      }
+
+      try {
+        setLoadingAreas(true);
+        const data = (await areaApi.getNames(cityId)) as unknown as Area[];
+
+        setAreas((prev) => {
+          // Merge fetched areas with existing (which might have our seeded area)
+          const newAreas = [...prev];
+          data.forEach((area: any) => {
+            if (!newAreas.find((a) => String(a._id) === String(area._id))) {
+              newAreas.push(area);
+            }
+          });
+          return newAreas;
+        });
+      } catch (error: any) {
+        console.error("Error fetching areas:", error);
+        toast.error("Error", {
+          description: "Failed to load areas. Please try again.",
+        });
+        // Leave whatever is already there — including this listing's own area.
+      } finally {
+        setLoadingAreas(false);
+      }
+    };
+
+    if (!loadingProperty) {
+      fetchAreas();
+    }
+  }, [cityId, areaId, loadingProperty]);
+  /*
+   * What the two dropdowns actually render.
+   *
+   * The fetched list first, then this listing's own city/area if the fetch
+   * did not include it — which happens more often than it should, because
+   * part of the areas collection stores `city` as a string rather than an
+   * ObjectId and /areas?cityId= used to miss those rows entirely.
+   */
+  const cityOptions = useMemo(() => {
+    if (!loadedCity) return cities;
+    return cities.some((c) => String(c._id) === String(loadedCity._id))
+      ? cities
+      : [loadedCity, ...cities];
+  }, [cities, loadedCity]);
+
+  const areaOptions = useMemo(() => {
+    if (!loadedArea) return areas;
+    return areas.some((a) => String(a._id) === String(loadedArea._id))
+      ? areas
+      : [loadedArea, ...areas];
+  }, [areas, loadedArea]);
+
+  /** The chosen city and area by name, for the map search box. */
+  const selectedCityName =
+    cityOptions.find((c) => String(c._id) === cityId)?.name ?? "";
+  /*
+   * The marla the size is read in: the listing's own (what it was entered in;
+   * 225 for every older listing) — only a move to another city switches to
+   * that city's. Nothing already listed is re-based.
+   */
+  const cityMarla =
+    cityChoice === null
+      ? originalSize?.marlaSqft ?? 225
+      : Number(cityOptions.find((c) => String(c._id) === cityId)?.marlaSqft) || 225;
+  const selectedAreaName =
+    areaOptions.find((a) => String(a._id) === areaId)?.name ?? "";
+
+  const handleCreateCity = async () => {
+    if (!newCityName.trim()) return;
+    try {
+      setIsAddingLocation(true);
+      const data = await cityApi.suggest(newCityName.trim());
+      toast.success(data.created ? `${data.name} added` : `${data.name} selected — it was already on the list`);
+      const allCities = await cityApi.getNames();
+      setCities(allCities);
+      setCityId(String(data._id));
+      setAreaId("");
+      setShowAddCityModal(false);
+      setNewCityName("");
+    } catch (error: any) {
+      toast.error(error.response?.data?.message || "Failed to add city");
+    } finally {
+      setIsAddingLocation(false);
+    }
+  };
+
+  const generateSlug = (value: string) =>
+    value
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+  const handleCreateArea = async () => {
+    if (!newAreaName.trim() || !cityId) return;
+    try {
+      setIsAddingLocation(true);
+      const data = await areaApi.suggest(cityId, newAreaName.trim());
+      toast.success(data.created ? `${toTitleCase(data.name)} added` : `${toTitleCase(data.name)} selected — it was already on the list`);
+      const allAreas = (await areaApi.getNames(cityId)) as unknown as Area[];
+      setAreas(allAreas);
+      setAreaId(String(data._id));
+      setShowAddAreaModal(false);
+      setNewAreaName("");
+    } catch (error: any) {
+      toast.error(error.response?.data?.message || "Failed to add area");
+    } finally {
+      setIsAddingLocation(false);
+    }
+  };
+
+  // Map frontend propertyType to backend format (lowercase)
+  const mapPropertyTypeToBackend = (type: string): string => {
+    const mapping: Record<string, string> = {
+      House: "house",
+      "Upper Portion": "upper-portion",
+      "Lower Portion": "lower-portion",
+      Flat: "flat",
+      Apartment: "apartment",
+      Room: "room",
+      Hostel: "hostel",
+      Shop: "shop",
+      Office: "office",
+      Warehouse: "warehouse",
+      Commercial: "commercial",
+    };
+    return mapping[type] || type.toLowerCase();
+  };
+
+  // `targetStatus` lets the same handler power three buttons:
+  //   - undefined  -> just save (preserve existing status)
+  //   - 'draft'    -> save and force draft
+  //   - 'pending'  -> publish (re-submit for approval / publish if admin)
+  const handleSubmit = async (
+    e: React.FormEvent,
+    targetStatus?: "draft" | "pending",
+  ) => {
+    e.preventDefault();
+
+    const isDraftSave = targetStatus === "draft";
+
+    // Validation: drafts only require a title; otherwise enforce full set.
+    if (isDraftSave) {
+      if (!title) {
+        toast.error("Please enter at least a title to save as draft");
+        return;
+      }
+    } else {
+      if (
+        !propertyType ||
+        !cityId ||
+        !areaId ||
+        !title ||
+        !location ||
+        (!noRooms && (!bedrooms || !bathrooms)) ||
+        !areaSize ||
+        !price ||
+        !description ||
+        !contactNumber
+      ) {
+        toast.error("Please fill in all required fields");
+        return;
+      }
+
+      if (photos.length === 0 && !videoUrl) {
+        toast.error("Keep at least one photo or walkthrough video");
+        return;
+      }
+    }
+
+    setIsLoading(true);
+
+    try {
+      // Create FormData
+      const formData = new FormData();
+
+      // Add JSON data as separate fields (backend expects these in the body)
+      formData.append("listingType", listingType);
+      formData.append("propertyType", mapPropertyTypeToBackend(propertyType));
+      /*
+       * Only sent when there is one.
+       *
+       * A draft save skips the required-field check, so an empty areaId used
+       * to go out as `area=""` and take the listing's location with it. Left
+       * out entirely, the server keeps whatever the listing already had —
+       * which is the only safe reading of "the user did not pick an area".
+       */
+      if (areaId) formData.append("area", areaId); // Area ID (ObjectId)
+      formData.append("title", title);
+      formData.append("location", location);
+      formData.append("bedrooms", noRooms ? "0" : bedrooms);
+      formData.append("bathrooms", noRooms ? "0" : bathrooms);
+      formData.append("areaSize", areaSize); // Property size in sq ft
+      formData.append("price", price);
+      /*
+       * These two columns drive the marla/kanal size filters and the area
+       * landing pages. Recomputed from the size only when the size was
+       * actually changed — otherwise the values already on the listing are
+       * sent back untouched.
+       */
+      const sizeUnchanged =
+        originalSize?.areaSize === areaSize && originalSize?.marlaSqft === cityMarla;
+      const { marla, kanal } = sizeUnchanged
+        ? { marla: originalSize?.marla ?? 0, kanal: originalSize?.kanal ?? 0 }
+        : marlaKanalFor(Number(areaSize), cityMarla);
+      if (marla > 0) formData.append("marla", String(marla));
+      if (kanal > 0) formData.append("kanal", String(kanal));
+      formData.append("marlaSqft", String(cityMarla));
+      formData.append("description", description);
+      formData.append("contactNumber", contactNumber);
+      formData.append("whatsappNumber", whatsappNumber || contactNumber);
+
+      // Every photo is already in the media library, so post URLs. The first
+      // is the cover; the rest are the gallery, in the order shown.
+      const [cover, ...rest] = photos;
+      const effectiveCover = cover || videoPosterUrl || "";
+      if (effectiveCover) formData.append("mainPhotoUrl", effectiveCover);
+      for (const url of rest) formData.append("additionalPhotosUrls", url);
+      // Tells the API this list is the gallery as it now stands, so removing
+      // the last extra photo is saved as "no extra photos" rather than ignored.
+      formData.append("photosProvided", "true");
+      // Always sent, so clearing the video actually removes it.
+      formData.append("videoUrl", videoUrl);
+      formData.append("videoPosterUrl", videoPosterUrl);
+
+      if (latitude !== undefined)
+        formData.append("latitude", latitude.toString());
+      if (longitude !== undefined)
+        formData.append("longitude", longitude.toString());
+
+      // Add features (filter out empty strings)
+      const validFeatures = features.filter((f) => f.trim() !== "");
+      if (validFeatures.length > 0) {
+        validFeatures.forEach((feature, index) => {
+          formData.append(`features[${index}]`, feature);
+        });
+      }
+
+      // Communicate desired status change to backend (role-based enforcement
+      // happens server-side: non-admins can only flip between draft/pending).
+      if (targetStatus) formData.append("status", targetStatus);
+
+      // Update property using the property ID
+      const response = await propertyApi.update(propertyId, formData);
+      void refreshListing((response as any)?.slug ?? (response as any)?.data?.slug ?? (response as any)?.property?.slug, getAccessToken());
+
+      const successMsg = isDraftSave
+        ? "Saved as draft"
+        : targetStatus === "pending"
+          ? "Property submitted for approval"
+          : "Property updated successfully!";
+      const successDesc = isDraftSave
+        ? "You can publish it later from the dashboard."
+        : "Your property has been updated.";
+      toast.success(successMsg, { description: successDesc });
+
+      // Redirect to dashboard after a short delay
+      setTimeout(() => {
+        router.push("/dashboard/property");
+        router.refresh();
+      }, 1500);
+    } catch (error: any) {
+      console.error("Error updating property:", error);
+      const errorMessage =
+        error.response?.data?.message ||
+        error.message ||
+        "Failed to update property. Please try again.";
+
+      toast.error("Update Failed", {
+        description: errorMessage,
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="w-full">
+      <div className="max-w-5xl mx-auto">
+        <div className="bg-white rounded-xl border shadow-sm px-3 py-4 sm:p-6 lg:p-8">
+          <h1 className="text-2xl font-semibold text-gray-800 mb-2">
+            Update Property
+          </h1>
+          <p className="text-gray-600 mb-6">
+            Fill in the details to update your property
+          </p>
+
+          {/* On the market — the same controls as the listings table, here too. */}
+          {propertyId && (
+            <div className="mb-8 rounded-xl border border-gray-200 bg-gray-50 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-gray-800">On the market</p>
+                  <p className="text-xs text-gray-500">Saved straight away. A rented listing hides its contact details.</p>
+                </div>
+                {listingSlug && (
+                  <a href={`/properties/${listingSlug}`} target="_blank" rel="noopener" className="text-sm font-medium text-primary hover:underline">
+                    View on site
+                  </a>
+                )}
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                {(["available", "rented"] as const).map((a) => (
+                  <button
+                    key={a}
+                    type="button"
+                    disabled={marketBusy}
+                    onClick={async () => {
+                      if (a === availability) return;
+                      setMarketBusy(true);
+                      try {
+                        await propertyApi.setAvailability(String(propertyId), a);
+                        setAvailabilityState(a);
+                        toast.success(a === "available" ? "Back on the market" : "Marked rented out");
+                      } catch (err: any) {
+                        toast.error(err?.response?.data?.message || "Could not change it");
+                      } finally {
+                        setMarketBusy(false);
+                      }
+                    }}
+                    className={`rounded-lg px-4 py-2 text-sm font-semibold transition-colors ${
+                      availability === a
+                        ? a === "available"
+                          ? "bg-emerald-600 text-white"
+                          : "bg-red-600 text-white"
+                        : "bg-white text-gray-700 ring-1 ring-gray-200 hover:bg-gray-100"
+                    }`}
+                  >
+                    {a === "available" ? "Available" : "Rented out"}
+                  </button>
+                ))}
+                <label className="ml-auto flex items-center gap-2 text-sm font-medium text-gray-700">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-amber-500"
+                    checked={featured}
+                    disabled={marketBusy}
+                    onChange={async (e) => {
+                      const next = e.target.checked;
+                      setMarketBusy(true);
+                      try {
+                        await propertyApi.setFeatured(String(propertyId), next);
+                        setFeatured(next);
+                        toast.success(next ? "Featured — pinned above the rest" : "No longer featured");
+                      } catch (err: any) {
+                        toast.error(err?.response?.data?.message || "Could not change it");
+                      } finally {
+                        setMarketBusy(false);
+                      }
+                    }}
+                  />
+                  ★ Featured
+                </label>
+              </div>
+            </div>
+          )}
+
+          <form onSubmit={(e) => handleSubmit(e)} className="space-y-6">
+            {/* Rent Ghar lists rentals only: no sale / rent choice. */}
+            <p className="rounded-lg bg-accent px-3 py-2 text-sm font-medium text-accent-foreground">
+              Listing for rent — Rent Ghar only lists rentals.
+            </p>
+
+            {/* Property Type */}
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-3">
+                Property Type *
+              </label>
+              <Select
+                value={propertyType}
+                onValueChange={setPropertyType}
+                disabled={isLoading}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select property type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="House">House</SelectItem>
+                  <SelectItem value="Upper Portion">Upper Portion</SelectItem>
+                  <SelectItem value="Lower Portion">Lower Portion</SelectItem>
+                  <SelectItem value="Flat">Flat</SelectItem>
+                  <SelectItem value="Apartment">Apartment</SelectItem>
+                  <SelectItem value="Room">Room</SelectItem>
+                  <SelectItem value="Hostel">Hostel</SelectItem>
+                  <SelectItem value="Shop">Shop</SelectItem>
+                  <SelectItem value="Office">Office</SelectItem>
+                  <SelectItem value="Warehouse">Warehouse</SelectItem>
+                  <SelectItem value="Commercial">Commercial</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* City and Area Selection */}
+            {locationUnresolved && !loadingProperty && (
+              <div className="flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                <span aria-hidden className="mt-0.5 font-bold">!</span>
+                <span>
+                  This listing&apos;s saved city and area could not be loaded, so
+                  they are not selected below. Pick them again before saving —
+                  otherwise the location on the live page will change.
+                </span>
+              </div>
+            )}
+            <div className="grid md:grid-cols-2 gap-6">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  City *
+                </label>
+                {/* A city typed or picked. (The old Radix Select echoed value changes back as picks and wiped the area; this one only reports a person's choice.) */}
+                <CityPicker
+                  options={cityOptions.map((city) => ({ value: String(city._id), label: city.name }))}
+                  value={cityId}
+                  onChange={(value) => {
+                    if (value === cityId) return;
+                    setCityId(value);
+                    setAreaId("");
+                  }}
+                  disabled={isLoading || loadingProperty}
+                  placeholder={loadingProperty ? "Loading property..." : "Type a city — e.g. Lahore"}
+                  inputClassName="h-10 w-full rounded-md border border-input bg-background text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                />
+                {/* Anyone listing can add a missing city — the API reuses one that exists. */}
+                {Boolean(user) && (
+                  <button type="button" onClick={() => setShowAddCityModal(true)} className="mt-2 inline-flex items-center text-sm font-medium text-primary hover:underline">
+                    <Plus className="mr-1 h-4 w-4" /> City not in the list? Add it
+                  </button>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  Area *
+                </label>
+                <Select
+                  // Same reason as the city Select above.
+                  key={loadedArea ? "ready" : "loading"}
+                  value={areaId}
+                  onValueChange={setAreaId}
+                  disabled={isLoading || loadingAreas || !cityId}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue
+                      placeholder={
+                        !cityId
+                          ? "Select city first"
+                          : loadingAreas
+                            ? "Loading areas..."
+                            : "Select area"
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {areaOptions.map((area) => (
+                      <SelectItem
+                        key={String(area._id)}
+                        value={String(area._id)}
+                      >
+                        {area.name}
+                      </SelectItem>
+                    ))}
+                    {cityId && (
+                      <div
+                        className="relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 text-primary font-medium hover:bg-gray-100 cursor-pointer"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setShowAddAreaModal(true);
+                        }}
+                      >
+                        <Plus className="w-4 h-4 mr-2" /> Add New Area
+                      </div>
+                    )}
+                  </SelectContent>
+                </Select>
+                {!cityId ? (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Please select a city first
+                  </p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Area not in the list? Open the list and tap <b>Add New Area</b> at the end — just its name, e.g. &quot;DHA Phase 6&quot;.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Property Title */}
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-3">
+                Property Title *
+              </label>
+              <input
+                type="text"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="E.g., Luxury 3 Bedroom Apartment in DHA"
+                disabled={isLoading}
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+            </div>
+
+            {/* Location */}
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-3">
+                Location / Address *
+              </label>
+              <input
+                type="text"
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                placeholder="Enter complete address"
+                disabled={isLoading}
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+            </div>
+
+            {/* Map Selection */}
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-3">
+                Pin Location on Map
+              </label>
+              <div className="mb-2">
+                {/*
+                  The map is tied to the address: "Find from address" searches
+                  the street, area and city entered above, so the pin and the
+                  written address describe the same place instead of drifting
+                  apart. The city also decides the opening view.
+                */}
+                <MapPicker
+                  onLocationSelect={(lat, lng) => {
+                    setLatitude(lat);
+                    setLongitude(lng);
+                  }}
+                  initialLat={latitude}
+                  initialLng={longitude}
+                  addressQuery={[location, selectedAreaName, selectedCityName]
+                    .filter(Boolean)
+                    .join(", ")}
+                  city={selectedCityName}
+                  area={selectedAreaName}
+                />
+              </div>
+              <p className="text-xs text-gray-500">
+                Click on the map to pin the exact location of your property.
+                {latitude && longitude && (
+                  <span className="text-green-600 font-medium ml-1">
+                    Location pinned: {latitude.toFixed(4)},{" "}
+                    {longitude.toFixed(4)}
+                  </span>
+                )}
+              </p>
+            </div>
+
+            {/* Beds, baths and size */}
+            <div className="grid md:grid-cols-3 gap-6">
+              {!noRooms && <>
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  Bedrooms *
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  value={bedrooms}
+                  onChange={(e) => setBedrooms(e.target.value)}
+                  placeholder="0"
+                  disabled={isLoading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  Bathrooms *
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  value={bathrooms}
+                  onChange={(e) => setBathrooms(e.target.value)}
+                  placeholder="0"
+                  disabled={isLoading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+              </div>
+              </>}
+              {/*
+                Marla / Kanal / sq ft in one control.
+
+                There used to be a required "Property Size (sq ft)" box plus
+                separate optional Marla and Kanal boxes — three numbers that
+                could contradict each other, and a house let as "5 marla" had to
+                be converted by hand. Square feet is still what gets stored and
+                sent, so existing listings and size filters are untouched.
+              */}
+              <AreaSizeField
+                value={areaSize}
+                onChange={setAreaSize}
+                label="Property size"
+                required
+                disabled={isLoading}
+                marlaSqft={cityMarla}
+              />
+            </div>
+
+            {/* Price, with the amount read back in lakh / crore */}
+            <PriceField
+              value={price}
+              onChange={setPrice}
+              mode="rent"
+              required
+              disabled={isLoading}
+            />
+
+            {/*
+              One gallery instead of a required "Main Photo" plus a separate
+              "Additional Photos" grid. Existing photos load in order, new ones
+              upload through the media library as they are picked, and the
+              first photo is the cover — drag to change it.
+            */}
+            <GalleryField
+              label="Property photos"
+              value={photos}
+              onChange={setPhotos}
+              folder="properties"
+              context={title || "Property listing"}
+              max={user?.role === "ADMIN" ? 50 : Math.max(photoLimit, photos.length)}
+              hint="The first photo is the cover shown in search results. Drag to reorder."
+            />
+
+            <VideoField
+              value={videoUrl}
+              posterValue={videoPosterUrl}
+              onChange={({ url, posterUrl }) => {
+                setVideoUrl(url);
+                setVideoPosterUrl(posterUrl);
+              }}
+              context={title || "Property walkthrough"}
+              disabled={isLoading}
+            />
+
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-3">
+                Property Description *
+              </label>
+              {/* rich editor */}
+              <RichEditor
+                value={description}
+                onChange={setDescription}
+                placeholder="Update property description..."
+                minHeight="min-h-[300px]"
+              />
+            </div>
+
+            {/*
+              Ticked, not typed: see lib/property-features.ts. The list shown
+              follows the property type, and anything an older listing already
+              says is kept as a custom chip.
+            */}
+            <FeaturesPicker
+              value={features.filter((feature) => feature.trim() !== "")}
+              onChange={setFeatures}
+              propertyType={propertyType}
+              purpose={listingType}
+              disabled={isLoading}
+            />
+
+            {/* Contact Number & WhatsApp Number */}
+            <div className="grid md:grid-cols-2 gap-6">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  Contact Number *
+                </label>
+                <input
+                  type="tel"
+                  value={contactNumber}
+                  onChange={(e) => setContactNumber(e.target.value)}
+                  placeholder="03XX XXXXXXX"
+                  disabled={isLoading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-3">
+                  WhatsApp Number (Optional)
+                </label>
+                <input
+                  type="tel"
+                  value={whatsappNumber}
+                  onChange={(e) => setWhatsappNumber(e.target.value)}
+                  placeholder="923XX XXXXXXX"
+                  disabled={isLoading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-800 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  If empty, contact number will be used for WhatsApp.
+                </p>
+              </div>
+            </div>
+
+            {/* Submit Buttons */}
+            <div className="flex flex-wrap gap-4 pt-6">
+              <Button
+                type="submit"
+                disabled={isLoading}
+                className="flex-1 min-w-[180px] bg-gray-800 hover:bg-gray-900"
+              >
+                {isLoading ? (
+                  <>
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                    Submitting...
+                  </>
+                ) : currentStatus === "draft" ? (
+                  "Save Changes"
+                ) : (
+                  "Update Property"
+                )}
+              </Button>
+
+              {/* If currently a draft, expose a Publish button to flip status */}
+              {currentStatus === "draft" && (
+                <Button
+                  type="button"
+                  onClick={(e: any) => handleSubmit(e, "pending")}
+                  disabled={isLoading}
+                  className="min-w-[160px] bg-emerald-600 hover:bg-emerald-700 text-white"
+                >
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                      Publishing...
+                    </>
+                  ) : (
+                    "Publish"
+                  )}
+                </Button>
+              )}
+
+              {/* Always allow saving the current draft (or downgrading) */}
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={(e: any) => handleSubmit(e, "draft")}
+                disabled={isLoading}
+                className="min-w-[160px]"
+              >
+                {isLoading ? (
+                  <>
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  "Save as Draft"
+                )}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => router.push("/dashboard")}
+                disabled={isLoading}
+              >
+                Cancel
+              </Button>
+            </div>
+          </form>
+          <Dialog open={showAddCityModal} onOpenChange={setShowAddCityModal}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Add New City</DialogTitle>
+                <DialogDescription>
+                  Enter the name of the new city to add it to the system.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">City Name</label>
+                  <input
+                    type="text"
+                    value={newCityName}
+                    onChange={(e) => setNewCityName(e.target.value)}
+                    placeholder="E.g., Islamabad"
+                    className="w-full px-3 py-2 border rounded-md"
+                  />
+                </div>
+                <Button
+                  onClick={handleCreateCity}
+                  disabled={isAddingLocation || !newCityName.trim()}
+                  className="w-full"
+                >
+                  {isAddingLocation ? (
+                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  ) : null}
+                  Add City
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+
+          {/* Add Area Modal */}
+          <Dialog open={showAddAreaModal} onOpenChange={setShowAddAreaModal}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Add New Area</DialogTitle>
+                <DialogDescription>
+                  Enter the name of the new area for the selected city.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Area Name</label>
+                  <input
+                    type="text"
+                    value={newAreaName}
+                    onChange={(e) => setNewAreaName(e.target.value)}
+                    placeholder="E.g., DHA Phase 1"
+                    className="w-full px-3 py-2 border rounded-md"
+                  />
+                </div>
+                <Button
+                  onClick={handleCreateArea}
+                  disabled={isAddingLocation || !newAreaName.trim()}
+                  className="w-full"
+                >
+                  {isAddingLocation ? (
+                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  ) : null}
+                  Add Area
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
+      </div>
+    </div>
+  );
+}

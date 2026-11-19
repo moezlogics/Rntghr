@@ -1,0 +1,1475 @@
+"use client";
+
+import { refreshListing } from "@/app/actions/refresh-cache";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  Building2,
+  Check,
+  ExternalLink,
+  Eye,
+  ImageOff,
+  Phone,
+  PlusCircle,
+  RefreshCcw,
+  RefreshCw,
+  RotateCcw,
+  UserRoundCog,
+  Send,
+  ShieldAlert,
+  ShieldCheck,
+  SquarePen,
+  Star,
+  Tag,
+  Trash2,
+  X,
+  Play,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { propertyApi, subscriptionApi, teamApi, getAccessToken, type TeamMember } from "@/lib/api";
+import type { BackendProperty } from "@/lib/types/property-utils";
+import { PROPERTY_TYPE_ORDER } from "@/lib/types/property-utils";
+import { useAuth } from "@/context/auth-context";
+import { cn } from "@/lib/utils";
+import {
+  ConfirmDialog,
+  DataCard,
+  EmptyRow,
+  ErrorRow,
+  FilterChips,
+  NoResultsRow,
+  PageHeader,
+  PaginationBar,
+  TableSkeleton,
+  TableToolbar,
+  useConfirm,
+  useServerTable,
+  useStoredState,
+} from "@/components/dashboard";
+import { apiErrorMessage } from "@/components/dashboard/api-error";
+import { amountShort, propertySizeLabel } from "@/lib/pk";
+import { PropertyPreviewDialog } from "@/components/dashboard/property-preview-dialog";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { PosterLine } from "@/components/dashboard/poster-info";
+
+type StatusFilter = "all" | "draft" | "pending" | "approved" | "rejected" | "expired";
+
+const STATUS_FILTERS: StatusFilter[] = [
+  "all",
+  "draft",
+  "pending",
+  "approved",
+  "rejected",
+  "expired",
+];
+
+const STATUS_STYLES: Record<string, string> = {
+  approved: "bg-emerald-100 text-emerald-800 hover:bg-emerald-100",
+  pending: "bg-amber-100 text-amber-800 hover:bg-amber-100",
+  rejected: "bg-red-100 text-red-800 hover:bg-red-100",
+  draft: "bg-slate-200 text-slate-700 hover:bg-slate-200",
+  expired: "bg-orange-100 text-orange-800 hover:bg-orange-100",
+};
+
+/**
+ * Free plan: "Live until 18 Nov" on a listing with an end date, "Expired"
+ * once it has run out. A date, not a countdown — see AvailabilityChip.
+ */
+function ExpiryNote({ property }: { property: BackendProperty }) {
+  if (!property.expiresAt) return null;
+  const date = new Date(property.expiresAt).toLocaleDateString("en-PK", { day: "numeric", month: "short" });
+  return (
+    <span className={cn("mt-1 block text-[11px]", property.status === "expired" ? "font-semibold text-orange-700" : "text-muted-foreground")}>
+      {property.status === "expired" ? `Expired ${date} — renew to show it again` : `Live until ${date}`}
+    </span>
+  );
+}
+
+// Property, Type, Location, Price, Status, Views, Created, Actions.
+const COLUMN_COUNT = 8;
+
+/** "pending" -> "Pending"; never renders "undefinedundefined" for a missing status. */
+function titleCase(value?: string) {
+  if (!value) return "Unknown";
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function formatDate(value?: string) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleDateString("en-PK", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/** Thumbnail that degrades to an icon rather than calling a dead placeholder host. */
+/**
+ * Why the brain held this listing — or that it published it itself.
+ *
+ * The reasons are the whole point: "Phone number in the description" is a
+ * ten-second decision, an unexplained queue is an afternoon.
+ */
+/**
+ * "Rented" on a dashboard row.
+ *
+ * Availability is not the same thing as the approval status beside it, so it
+ * gets its own chip rather than being folded into that one — an approved
+ * listing that has been rented out is still approved, and it goes back on the market
+ * without re-entering the queue.
+ */
+function AvailabilityChip({
+  property,
+}: {
+  property: BackendProperty & { availabilityChangedAt?: string | null };
+}) {
+  // Both can be true at once — a featured listing can also be rented — so
+  // this renders the pair rather than returning on the first one it finds.
+  const featured = property.isFeatured ? (
+    <span className="mt-1 block">
+      <Badge className="bg-amber-100 text-amber-900 hover:bg-amber-100">
+        Featured
+      </Badge>
+    </span>
+  ) : null;
+
+  const value = property.availability;
+  if (!value || value === "available") return featured;
+
+  /*
+   * The date it was marked, not "x days left".
+   *
+   * A countdown would mean reading the clock while rendering, which makes the
+   * markup depend on the instant it was produced — the server and the browser
+   * then disagree and React reports a hydration mismatch. The date is a fact
+   * about the row, and the rule it feeds (15 days) is stated in the tooltip.
+   */
+  const marked = property.availabilityChangedAt
+    ? formatDate(property.availabilityChangedAt)
+    : null;
+
+  return (
+    <>
+      {featured}
+      <span
+        className="mt-1 block"
+        title={
+          marked
+            ? `Marked ${value} on ${marked}. Contact details are hidden now; it leaves search 15 days after that date, and its own page keeps working.`
+            : `Marked ${value}. Contact details are hidden.`
+        }
+      >
+        <Badge className="bg-neutral-900 text-white hover:bg-neutral-900">
+          Rented
+        </Badge>
+      </span>
+    </>
+  );
+}
+
+function ModerationNote({
+  property,
+}: {
+  property: {
+    status?: string;
+    moderationScore?: number;
+    moderationReasons?: string[];
+    autoPublished?: boolean;
+  };
+}) {
+  const score = property.moderationScore ?? 0;
+  const reasons = property.moderationReasons ?? [];
+
+  if (property.status === "pending" && reasons.length > 0) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="mt-1 inline-flex cursor-help items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
+            <ShieldAlert className="h-3 w-3" />
+            Held · {score}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          <p className="mb-1 font-semibold">Why this needs checking</p>
+          <ul className="list-disc space-y-0.5 pl-4 text-xs">
+            {reasons.slice(0, 6).map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  if (property.autoPublished && property.status === "approved") {
+    return (
+      <span
+        title={`Published automatically — risk score ${score}/100`}
+        className="mt-1 inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-800"
+      >
+        <ShieldCheck className="h-3 w-3" />
+        Auto
+      </span>
+    );
+  }
+
+  return null;
+}
+
+/** Call taps + WhatsApp taps: the enquiries a listing produced. */
+function contactsOf(property: {
+  phoneClicks?: number;
+  whatsappClicks?: number;
+}): number {
+  return (property.phoneClicks ?? 0) + (property.whatsappClicks ?? 0);
+}
+
+/** Admin-only line showing the real listing owner's contact details & original source URL. */
+function SourceOwnerLine({ property }: { property: BackendProperty }) {
+  const hasOwner = Boolean(property.sourceOwnerName || property.sourceOwnerPhone);
+  const hasUrl = Boolean(property.sourceUrl);
+  if (!hasOwner && !hasUrl) return null;
+
+  const waDigits = (property.sourceOwnerWhatsapp || property.sourceOwnerPhone || "").replace(/\D/g, "");
+  const waNum = waDigits.startsWith("92") ? waDigits : waDigits ? `92${waDigits.replace(/^0/, "")}` : "";
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-slate-600">
+      {property.sourceOwnerName && (
+        <span className="font-semibold text-indigo-900">
+          Real Owner: {property.sourceOwnerName}
+        </span>
+      )}
+      {property.sourceOwnerPhone && (
+        <a
+          href={`tel:${property.sourceOwnerPhone}`}
+          className="inline-flex items-center gap-1 rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-indigo-800 hover:bg-indigo-100"
+          title="Call real listing owner"
+        >
+          <Phone className="h-2.5 w-2.5" />
+          {property.sourceOwnerPhone}
+        </a>
+      )}
+      {waNum && (
+        <a
+          href={`https://wa.me/${waNum}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 rounded bg-emerald-50 px-1.5 py-0.5 text-[11px] font-semibold text-emerald-800 hover:bg-emerald-100"
+          title="WhatsApp real listing owner"
+        >
+          WhatsApp
+        </a>
+      )}
+      {property.sourceUrl && (
+        <a
+          href={property.sourceUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-semibold text-amber-900 hover:bg-amber-100 hover:underline"
+          title="Open original scraped listing"
+        >
+          <ExternalLink className="h-2.5 w-2.5" />
+          Source Link
+        </a>
+      )}
+    </div>
+  );
+}
+
+function Thumbnail({
+  src,
+  alt,
+  videoUrl,
+  videoPosterUrl,
+}: {
+  src?: string;
+  alt: string;
+  videoUrl?: string | null;
+  videoPosterUrl?: string | null;
+}) {
+  // Track which src failed, so a row whose image changes retries on its own.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const effectiveSrc = src || videoPosterUrl || "";
+  const failed = Boolean(effectiveSrc) && failedSrc === effectiveSrc;
+  const isVideo = Boolean(videoUrl || videoPosterUrl);
+
+  if ((!effectiveSrc || failed) && !videoUrl) {
+    return (
+      <div className="flex h-11 w-14 shrink-0 items-center justify-center rounded-md bg-muted">
+        <ImageOff className="h-4 w-4 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-11 w-14 shrink-0 overflow-hidden rounded-md border bg-black">
+      {effectiveSrc && !failed ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={effectiveSrc}
+          alt={alt}
+          loading="lazy"
+          onError={() => setFailedSrc(effectiveSrc)}
+          className="h-full w-full object-cover"
+        />
+      ) : videoUrl ? (
+        <video
+          src={`${videoUrl}#t=0.5`}
+          preload="metadata"
+          muted
+          playsInline
+          className="h-full w-full object-cover pointer-events-none"
+        />
+      ) : (
+        <div className="flex h-full w-full items-center justify-center bg-muted">
+          <ImageOff className="h-4 w-4 text-muted-foreground" />
+        </div>
+      )}
+      {isVideo && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/20">
+          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-black/60 text-white shadow">
+            <Play className="h-2.5 w-2.5 fill-white text-white ml-0.5" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function PropertiesPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const { user } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
+  // An agency's agent posts and edits; featuring and deleting stay with the agency owner.
+  const [isAgent, setIsAgent] = useState(false);
+  // An agency owner can hand a listing to one of their agents (or take it back).
+  const [team, setTeam] = useState<TeamMember[]>([]);
+  const [assigning, setAssigning] = useState<{ property: BackendProperty; to: string } | null>(null);
+  useEffect(() => {
+    if (!user || isAdmin) return;
+    subscriptionApi
+      .getMyPlan()
+      .then((p) => {
+        setIsAgent(p?.team.role === "agent");
+        if (p?.team.role === "owner") teamApi.list().then((t) => setTeam(t.members)).catch(() => undefined);
+      })
+      .catch(() => undefined);
+  }, [user, isAdmin]);
+  const ownerOf = (p: BackendProperty) => String((p as any).owner?._id ?? (p as any).owner ?? "");
+  const assignTo = async () => {
+    if (!assigning) return;
+    const { property, to } = assigning;
+    try {
+      setBusyId(property._id);
+      await teamApi.assign(property._id, to === "me" ? undefined : to);
+      const who = to === "me" ? "you" : team.find((m) => m._id === to)?.name ?? "the agent";
+      toast.success(`Listing given to ${who}`);
+      setAssigning(null);
+      table.reload();
+    } catch (err) {
+      toast.error("Could not move the listing", { description: apiErrorMessage(err, "Please try again.") });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  // ?ownerId= — one agent's listings (from My Team, or an admin's account list).
+  const ownerFilter = searchParams.get("ownerId") || undefined;
+  // Filters, page and scroll are remembered for this tab: edit a listing on
+  // page 4, come back, and you are on page 4 at that listing again.
+  const tableKey = `properties:${ownerFilter ?? "all"}`;
+  const [statusFilter, setStatusFilter] = useStoredState<StatusFilter>(`${tableKey}:status`, "all");
+  const [typeFilter, setTypeFilter] = useStoredState<string>(`${tableKey}:type`, "all");
+  const ownerLabel = searchParams.get("owner") || "this agent";
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  // Status counts come from a single aggregation rather than from counting a
+  // full download of every property in the browser.
+  const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
+
+  const [preview, setPreview] = useState<BackendProperty | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const { confirm, dialogProps } = useConfirm();
+
+  // Honour ?status= so the overview KPI cards can deep-link into a filtered view.
+  useEffect(() => {
+    const status = searchParams.get("status");
+    if (status && STATUS_FILTERS.includes(status as StatusFilter)) {
+      setStatusFilter(status as StatusFilter);
+    }
+  }, [searchParams, setStatusFilter]);
+
+  const loadStats = useCallback(async () => {
+    try {
+      const stats = await propertyApi.getDashboardStats();
+      setStatusCounts({ all: stats.total, ...stats.byStatus });
+    } catch {
+      // Counts are decoration on the filter chips; the table still works.
+      setStatusCounts({});
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
+
+  const filters = useMemo(
+    () => ({ status: statusFilter, propertyType: typeFilter, ownerId: ownerFilter }),
+    [statusFilter, typeFilter, ownerFilter],
+  );
+
+  const fetchPage = useCallback(
+    async (
+      query: {
+        page: number;
+        limit: number;
+        search: string;
+        sortBy: string | null;
+        sortDir: "asc" | "desc";
+      },
+      signal: AbortSignal,
+    ) => {
+      const result = await propertyApi.getAllProperties(
+        {
+          page: query.page,
+          limit: query.limit,
+          search: query.search,
+          status: statusFilter,
+          propertyType: typeFilter,
+          sortBy: query.sortBy ?? undefined,
+          sortDir: query.sortDir,
+          ownerId: ownerFilter,
+        },
+        signal,
+      );
+      const rows = await Promise.all(
+        (result.properties ?? []).map(async (p: BackendProperty) => {
+          if (p.source && p.source !== "manual" && !p.sourceOwnerPhone && !p.sourceUrl) {
+            try {
+              const full = await propertyApi.getPropertyById({ id: p._id });
+              return {
+                ...p,
+                sourceUrl: full.sourceUrl,
+                sourceOwnerName: full.sourceOwnerName,
+                sourceOwnerPhone: full.sourceOwnerPhone,
+                sourceOwnerWhatsapp: full.sourceOwnerWhatsapp,
+                sourceOwnerProfileUrl: full.sourceOwnerProfileUrl,
+              };
+            } catch {
+              return p;
+            }
+          }
+          return p;
+        }),
+      );
+      return { rows, total: result.total };
+    },
+    [statusFilter, typeFilter, ownerFilter],
+  );
+
+  const table = useServerTable<BackendProperty>({
+    fetchPage,
+    filters,
+    initialPageSize: 25,
+    initialSortKey: "createdAt",
+    initialSortDirection: "desc",
+    persistKey: tableKey,
+  });
+
+  const openPreview = async (propertyId: string) => {
+    setPreviewOpen(true);
+    setPreviewLoading(true);
+    // Show what the list already knows while the full record loads. The list
+    // no longer carries `description` or the photo gallery, so the detail
+    // request is what fills those in.
+    setPreview(
+      table.rows.find((property) => property._id === propertyId) ?? null,
+    );
+    try {
+      const detail = await propertyApi.getPropertyById({ id: propertyId });
+      // The poster comes with the list, not with the single record.
+      const row: any = table.rows.find((property) => property._id === propertyId);
+      setPreview(row?.poster ? ({ ...detail, poster: row.poster } as any) : detail);
+    } catch (err) {
+      toast.error("Could not load property", {
+        description: apiErrorMessage(err, "Please try again."),
+      });
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const changeStatus = async (
+    property: BackendProperty,
+    target?: "pending" | "approved" | "rejected" | "draft",
+  ) => {
+    const next =
+      target ?? (property.status === "approved" ? "pending" : "approved");
+    try {
+      setBusyId(property._id);
+      const response = await propertyApi.updateStatus(property._id, next);
+      if (response?.success === false) {
+        toast.error(response.message ?? "Could not update status");
+        return;
+      }
+      // Patch in place so the current page, scroll position and filters survive.
+      table.patchRow((item) => item._id === property._id, { status: next });
+      void loadStats();
+      toast.success(
+        next === "approved"
+          ? "Property published"
+          : next === "pending"
+            ? "Sent for approval"
+            : `Status set to ${next}`,
+      );
+    } catch (err) {
+      console.error("Error updating status:", err);
+      toast.error("Could not update status", {
+        description: apiErrorMessage(err, "Please try again."),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /**
+   * Rented / back on the market.
+   *
+   * Open to the agent as well as the admin, and deliberately not part of the
+   * approval flow above: a house that was rented is not a listing that failed
+   * review, and marking it must not push it back into the queue.
+   *
+   * The listing keeps its page and stays in search for fifteen days with the
+   * phone number hidden, then drops out of the lists while the URL carries on
+   * working — see PropertyService.AVAILABILITY_GRACE_DAYS.
+   */
+  const changeAvailability = async (
+    property: BackendProperty,
+    availability: "available" | "rented",
+  ) => {
+    try {
+      setBusyId(property._id);
+      await propertyApi.setAvailability(property._id, availability);
+      // The listing page drops its phone number now, not when its cache runs out.
+      void refreshListing(property.slug, getAccessToken());
+      table.patchRow((item) => item._id === property._id, {
+        availability,
+        availabilityChangedAt:
+          availability === "available" ? null : new Date().toISOString(),
+      });
+      toast.success(
+        availability === "available"
+          ? "Back on the market"
+          : "Marked rented",
+        {
+          description:
+            availability === "available"
+              ? "It will show in search again."
+              : "Contact details are hidden now; it leaves search in 15 days.",
+        },
+      );
+    } catch (err) {
+      console.error("Error updating availability:", err);
+      toast.error("Could not update availability", {
+        description: apiErrorMessage(err, "Please try again."),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /**
+   * Pin a listing to the top of the public lists.
+   *
+   * Admin only, and with no reference to the owner's plan: featuring is an
+   * editorial call about what the site should be showing, not something a
+   * package buys. The API refuses it for anyone else regardless.
+   */
+  const renew = async (property: BackendProperty) => {
+    try {
+      setBusyId(property._id);
+      const r = await propertyApi.renew(property._id);
+      table.patchRow((item) => item._id === property._id, { status: r.status as BackendProperty["status"], expiresAt: r.expiresAt });
+      void loadStats();
+      toast.success(r.expiresAt ? "Renewed — live for another month" : "Back on the site");
+    } catch (err) {
+      toast.error("Could not renew", { description: apiErrorMessage(err, "Please try again.") });
+    } finally {
+      setBusyId(null);
+    }
+  };
+  const renewable = (p: BackendProperty) => p.status === "expired" || (p.status === "approved" && !!p.expiresAt);
+
+  const toggleFeatured = async (property: BackendProperty) => {
+    const next = !property.isFeatured;
+    try {
+      setBusyId(property._id);
+      await propertyApi.setFeatured(property._id, next);
+      void refreshListing(property.slug, getAccessToken());
+      table.patchRow((item) => item._id === property._id, { isFeatured: next });
+      toast.success(next ? "Featured" : "No longer featured", {
+        description: next
+          ? "It now shows above other listings on the site."
+          : "It goes back into the normal order.",
+      });
+    } catch (err) {
+      console.error("Error updating featured:", err);
+      toast.error("Could not update", {
+        description: apiErrorMessage(err, "Please try again."),
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const requestDelete = (property: BackendProperty) =>
+    confirm({
+      title: "Delete this property?",
+      description: `“${property.title}” will be permanently removed. This cannot be undone.`,
+      confirmLabel: "Delete property",
+      onConfirm: async () => {
+        try {
+          await propertyApi.delete(property._id);
+          void refreshListing(property.slug, getAccessToken());
+          table.removeRow((item) => item._id === property._id);
+          void loadStats();
+          toast.success("Property deleted");
+        } catch (err) {
+          console.error("Error deleting property:", err);
+          toast.error("Could not delete property", {
+            description: apiErrorMessage(err, "Please try again."),
+          });
+        }
+      },
+    });
+
+  const SortButton = ({
+    column,
+    children,
+    className,
+  }: {
+    column: string;
+    children: React.ReactNode;
+    className?: string;
+  }) => {
+    const active = table.sortKey === column;
+    const Icon = !active
+      ? ArrowUpDown
+      : table.sortDirection === "asc"
+        ? ArrowUp
+        : ArrowDown;
+    return (
+      <button
+        type="button"
+        onClick={() => table.toggleSort(column)}
+        className={cn(
+          "-ml-2 inline-flex items-center gap-1.5 rounded px-2 py-1 text-left font-medium transition-colors hover:bg-accent",
+          active && "text-foreground",
+          className,
+        )}
+      >
+        {children}
+        <Icon
+          className={cn("h-3.5 w-3.5", active ? "opacity-100" : "opacity-40")}
+        />
+      </button>
+    );
+  };
+
+  const filtersActive =
+    statusFilter !== "all" || typeFilter !== "all" || table.search !== "";
+
+  const resetAll = () => {
+    setStatusFilter("all");
+    setTypeFilter("all");
+    table.resetFilters();
+  };
+
+  // Nothing at all vs. nothing matching this filter — only the second offers
+  // "clear filters". The page payload can no longer tell us the unfiltered
+  // total, so the stats aggregation answers that.
+  const totalEverything = statusCounts.all ?? 0;
+  const showEmptyState =
+    table.matchedCount === 0 && !filtersActive && totalEverything === 0;
+
+  return (
+    <div className="mx-auto w-full max-w-[1600px] space-y-5">
+      <PageHeader
+        title={ownerFilter ? `Listings of ${ownerLabel}` : isAdmin ? "Properties" : "My Listings"}
+        description={
+          isAdmin
+            ? "Review, approve and manage every listing on the platform."
+            : "Manage the properties you have listed."
+        }
+        actions={
+          <>
+            {ownerFilter && (
+              <Button variant="outline" onClick={() => router.push("/dashboard/property")}>
+                Show all listings
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              onClick={() => {
+                table.reload();
+                void loadStats();
+              }}
+              disabled={table.refreshing}
+            >
+              <RefreshCcw
+                className={cn(
+                  "mr-2 h-4 w-4",
+                  table.refreshing && "animate-spin",
+                )}
+              />
+              Refresh
+            </Button>
+            <Button
+              onClick={() => router.push("/dashboard/property/add-property")}
+            >
+              <PlusCircle className="mr-2 h-4 w-4" />
+              Add Property
+            </Button>
+          </>
+        }
+      />
+
+      <DataCard flush>
+        {/* Toolbar: search, status chips and type filter */}
+        <div className="space-y-4 border-b p-5">
+          <TableToolbar
+            search={table.search}
+            onSearchChange={table.setSearch}
+            placeholder="Search by title, location, city or phone…"
+          >
+            <Select value={typeFilter} onValueChange={setTypeFilter}>
+              <SelectTrigger
+                className="w-[170px]"
+                aria-label="Filter by property type"
+              >
+                <SelectValue placeholder="All types" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All types</SelectItem>
+                {PROPERTY_TYPE_ORDER.map((type) => (
+                  <SelectItem key={type} value={type} className="capitalize">
+                    {titleCase(type)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {filtersActive && (
+              <Button variant="ghost" size="sm" onClick={resetAll}>
+                <X className="mr-1.5 h-3.5 w-3.5" />
+                Clear
+              </Button>
+            )}
+          </TableToolbar>
+
+          <FilterChips<StatusFilter>
+            aria-label="Filter by status"
+            value={statusFilter}
+            onChange={setStatusFilter}
+            options={STATUS_FILTERS.map((status) => ({
+              value: status,
+              label: titleCase(status),
+              count: statusCounts[status],
+            }))}
+          />
+        </div>
+
+        {/*
+          Phones get cards. The table stays for tablets and up, where seven
+          columns actually fit.
+        */}
+        <div
+          className={cn(
+            "space-y-3 p-4 transition-opacity md:hidden",
+            table.refreshing && "opacity-60",
+          )}
+        >
+          {table.loading ? (
+            [0, 1, 2, 3, 4].map((row) => (
+              <Skeleton key={row} className="h-32 w-full rounded-xl" />
+            ))
+          ) : table.error ? (
+            <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm">
+              <p className="font-medium text-red-900">{table.error}</p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                onClick={table.reload}
+              >
+                Try again
+              </Button>
+            </div>
+          ) : table.rows.length === 0 ? (
+            <div className="py-10 text-center">
+              <Building2 className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">
+                {showEmptyState
+                  ? "No properties yet."
+                  : "Nothing matches those filters."}
+              </p>
+              {showEmptyState ? (
+                <Button
+                  size="sm"
+                  className="mt-4"
+                  onClick={() => router.push("/dashboard/property/add-property")}
+                >
+                  <PlusCircle className="mr-2 h-4 w-4" />
+                  Add Property
+                </Button>
+              ) : (
+                <Button variant="outline" size="sm" className="mt-4" onClick={resetAll}>
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          ) : (
+            table.rows.map((property) => {
+              const busy = busyId === property._id;
+              const contacts = contactsOf(property);
+
+              return (
+                <div
+                  key={property._id}
+                  className={cn(
+                    "rounded-xl border bg-card p-3",
+                    busy && "opacity-60",
+                  )}
+                >
+                  <div className="flex gap-3">
+                    <Thumbnail
+                      src={property.mainPhotoUrl}
+                      alt={property.title}
+                      videoUrl={property.videoUrl}
+                      videoPosterUrl={property.videoPosterUrl}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <button
+                        type="button"
+                        onClick={() => void openPreview(property._id)}
+                        className="block w-full truncate text-left text-sm font-semibold"
+                      >
+                        {property.title}
+                      </button>
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                        {property.location ?? "—"}
+                      </p>
+                      {!ownerFilter && <PosterLine poster={(property as any).poster} className="mt-0.5" />}
+                      {isAdmin && <SourceOwnerLine property={property} />}
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className="text-sm font-semibold tabular-nums">
+                          {amountShort(property.price) || "—"}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {propertySizeLabel(property)}
+                        </span>
+                        <span className="ml-auto flex shrink-0 flex-col items-end">
+                          <Badge
+                            className={cn(
+                              STATUS_STYLES[property.status] ??
+                                "bg-muted text-muted-foreground",
+                            )}
+                          >
+                            {titleCase(property.status)}
+                          </Badge>
+                          <ModerationNote property={property} />
+                          <ExpiryNote property={property} />
+                          <AvailabilityChip property={property} />
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-2.5 flex items-center gap-4 border-t pt-2.5 text-xs text-muted-foreground">
+                    <span className="flex items-center gap-1 tabular-nums">
+                      <Eye className="h-3.5 w-3.5" />
+                      {(property.views ?? 0).toLocaleString("en-PK")}
+                    </span>
+                    {contacts > 0 && (
+                      <span className="font-medium text-emerald-700">
+                        {contacts} enquir{contacts === 1 ? "y" : "ies"}
+                      </span>
+                    )}
+                    <span className="ml-auto">
+                      {formatDate(property.createdAt)}
+                    </span>
+                  </div>
+
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    {/* Shown to agents too: their plan's allowance decides,
+                        and the API is what enforces it — a Free account gets
+                        a message naming the plan that would allow it, which
+                        is a better advert than hiding the button. */}
+                    {!isAgent && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => void toggleFeatured(property)}
+                    >
+                      <Star
+                        className={cn(
+                          "mr-1.5 h-3.5 w-3.5",
+                          property.isFeatured && "fill-amber-400 text-amber-500",
+                        )}
+                      />
+                      {property.isFeatured ? "Featured" : "Feature"}
+                    </Button>
+                    )}
+                    {team.length > 0 && (
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => setAssigning({ property, to: ownerOf(property) === user?._id ? "me" : ownerOf(property) })}>
+                        <UserRoundCog className="mr-1.5 h-3.5 w-3.5" />
+                        Assign
+                      </Button>
+                    )}
+                    {renewable(property) && (
+                      <Button size="sm" variant={property.status === "expired" ? "default" : "outline"} disabled={busy} onClick={() => void renew(property)}>
+                        <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                        Renew
+                      </Button>
+                    )}
+                    {/* Owners get this one too: telling the site a house has
+                        gone should never need an admin. */}
+                    {property.availability && property.availability !== "available" ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() => void changeAvailability(property, "available")}
+                      >
+                        <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                        Back on market
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() =>
+                          void changeAvailability(property, "rented")
+                        }
+                      >
+                        Mark rented
+                      </Button>
+                    )}
+                    {property.status === "draft" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() =>
+                          void changeStatus(
+                            property,
+                            isAdmin ? "approved" : "pending",
+                          )
+                        }
+                      >
+                        <Send className="mr-1.5 h-3.5 w-3.5" />
+                        {isAdmin ? "Publish" : "Submit"}
+                      </Button>
+                    )}
+                    {isAdmin && property.status !== "draft" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() => void changeStatus(property)}
+                      >
+                        {property.status === "approved" ? (
+                          <>
+                            <X className="mr-1.5 h-3.5 w-3.5" />
+                            Unpublish
+                          </>
+                        ) : (
+                          <>
+                            <Check className="mr-1.5 h-3.5 w-3.5" />
+                            Approve
+                          </>
+                        )}
+                      </Button>
+                    )}
+                    <Button size="sm" variant="outline" asChild>
+                      <Link href={`/dashboard/property/edit/${property._id}`}>
+                        <SquarePen className="mr-1.5 h-3.5 w-3.5" />
+                        Edit
+                      </Link>
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void openPreview(property._id)}
+                    >
+                      <Eye className="mr-1.5 h-3.5 w-3.5" />
+                      Preview
+                    </Button>
+                    {!isAgent && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="ml-auto text-destructive hover:text-destructive"
+                      disabled={busy}
+                      onClick={() => requestDelete(property)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span className="sr-only">Delete</span>
+                    </Button>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div
+          className={cn(
+            "hidden overflow-x-auto transition-opacity md:block",
+            table.refreshing && "opacity-60",
+          )}
+        >
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="min-w-[280px]">
+                  <SortButton column="title">Property</SortButton>
+                </TableHead>
+                <TableHead>
+                  <SortButton column="propertyType">Type</SortButton>
+                </TableHead>
+                <TableHead className="min-w-[150px]">
+                  <SortButton column="location">Location</SortButton>
+                </TableHead>
+                <TableHead>
+                  <SortButton column="price">Price</SortButton>
+                </TableHead>
+                <TableHead>
+                  <SortButton column="status">Status</SortButton>
+                </TableHead>
+                <TableHead className="whitespace-nowrap">
+                  <SortButton column="views">Views</SortButton>
+                </TableHead>
+                <TableHead className="whitespace-nowrap">
+                  <SortButton column="createdAt">Created</SortButton>
+                </TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {table.loading ? (
+                <TableSkeleton rows={10} columns={COLUMN_COUNT} />
+              ) : table.error ? (
+                <ErrorRow
+                  colSpan={COLUMN_COUNT}
+                  message={table.error}
+                  onRetry={table.reload}
+                />
+              ) : showEmptyState ? (
+                <EmptyRow
+                  colSpan={COLUMN_COUNT}
+                  icon={Building2}
+                  title="No properties yet"
+                  description="Add your first listing and it will show up here."
+                  action={
+                    <Button
+                      size="sm"
+                      onClick={() =>
+                        router.push("/dashboard/property/add-property")
+                      }
+                    >
+                      <PlusCircle className="mr-2 h-4 w-4" />
+                      Add Property
+                    </Button>
+                  }
+                />
+              ) : table.matchedCount === 0 ? (
+                <NoResultsRow
+                  colSpan={COLUMN_COUNT}
+                  search={table.search}
+                  onReset={resetAll}
+                />
+              ) : (
+                table.rows.map((property) => {
+                  const busy = busyId === property._id;
+                  return (
+                    <TableRow
+                      key={property._id}
+                      className={cn(busy && "opacity-60")}
+                    >
+                      <TableCell>
+                        <div className="flex items-center gap-3">
+                          <Thumbnail
+                            src={property.mainPhotoUrl}
+                            alt={property.title}
+                            videoUrl={property.videoUrl}
+                            videoPosterUrl={property.videoPosterUrl}
+                          />
+                          <div className="min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => void openPreview(property._id)}
+                              className="block max-w-[260px] truncate text-left font-medium hover:text-primary hover:underline"
+                            >
+                              {property.title}
+                            </button>
+                            <p className="mt-0.5 text-xs text-muted-foreground">
+                              {property.bedrooms ?? 0} beds ·{" "}
+                              {property.bathrooms ?? 0} baths ·{" "}
+                              {propertySizeLabel(property)}
+                            </p>
+                            {!ownerFilter && <PosterLine poster={(property as any).poster} className="mt-0.5" />}
+                            {isAdmin && <SourceOwnerLine property={property} />}
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="capitalize">
+                          {property.propertyType ?? "—"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <p className="max-w-[170px] truncate text-sm">
+                          {property.location ?? "—"}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {typeof property.area === "object"
+                            ? (property.area?.city?.name ?? property.city ?? "")
+                            : (property.city ?? "")}
+                        </p>
+                      </TableCell>
+                      <TableCell>
+                        <p className="font-semibold tabular-nums">
+                          Rs {property.price?.toLocaleString("en-PK") ?? "—"}
+                        </p>
+                        {/* The same amount the way it is advertised. */}
+                        <p className="text-xs font-medium text-emerald-700">
+                          {amountShort(property.price)}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          per month
+                        </p>
+                      </TableCell>
+                      <TableCell>
+                        <Badge
+                          className={
+                            STATUS_STYLES[property.status] ??
+                            "bg-muted text-muted-foreground"
+                          }
+                        >
+                          {titleCase(property.status)}
+                        </Badge>
+                        <ModerationNote property={property} />
+                          <ExpiryNote property={property} />
+                        <AvailabilityChip property={property} />
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap">
+                        <span className="flex items-center gap-1.5 text-sm tabular-nums">
+                          <Eye className="h-3.5 w-3.5 text-muted-foreground" />
+                          {(property.views ?? 0).toLocaleString("en-PK")}
+                        </span>
+                        {contactsOf(property) > 0 && (
+                          <span className="mt-0.5 block text-xs text-emerald-700">
+                            {contactsOf(property)} enquir
+                            {contactsOf(property) === 1 ? "y" : "ies"}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-sm text-muted-foreground">
+                        {formatDate(property.createdAt)}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center justify-end gap-1">
+                          {!isAgent && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8"
+                                disabled={busy}
+                                onClick={() => void toggleFeatured(property)}
+                              >
+                                <Star
+                                  className={cn(
+                                    "h-4 w-4",
+                                    property.isFeatured
+                                      ? "fill-amber-400 text-amber-500"
+                                      : "text-muted-foreground",
+                                  )}
+                                />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {property.isFeatured
+                                ? "Remove from featured"
+                                : "Feature this listing"}
+                            </TooltipContent>
+                          </Tooltip>
+                          )}
+                          {team.length > 0 && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button variant="ghost" size="icon" className="h-8 w-8" disabled={busy} onClick={() => setAssigning({ property, to: ownerOf(property) === user?._id ? "me" : ownerOf(property) })}>
+                                  <UserRoundCog className="h-4 w-4 text-muted-foreground" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Give to an agent</TooltipContent>
+                            </Tooltip>
+                          )}
+                          {renewable(property) && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button variant="ghost" size="icon" className="h-8 w-8" disabled={busy} onClick={() => void renew(property)}>
+                                  <RefreshCw className={cn("h-4 w-4", property.status === "expired" ? "text-orange-600" : "text-muted-foreground")} />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>{property.status === "expired" ? "Renew — show it again for a month" : "Renew — restart its month"}</TooltipContent>
+                            </Tooltip>
+                          )}
+
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8"
+                                disabled={busy}
+                                onClick={() =>
+                                  void changeAvailability(
+                                    property,
+                                    property.availability &&
+                                      property.availability !== "available"
+                                      ? "available"
+                                      : "rented",
+                                  )
+                                }
+                              >
+                                {property.availability &&
+                                property.availability !== "available" ? (
+                                  <RotateCcw className="h-4 w-4 text-emerald-600" />
+                                ) : (
+                                  <Tag className="h-4 w-4 text-muted-foreground" />
+                                )}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {property.availability &&
+                              property.availability !== "available"
+                                ? "Put back on the market"
+                                : "Mark rented out"}
+                            </TooltipContent>
+                          </Tooltip>
+
+                          {property.status === "draft" && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 border-emerald-300 bg-emerald-50 px-2.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                              disabled={busy}
+                              onClick={() =>
+                                void changeStatus(
+                                  property,
+                                  isAdmin ? "approved" : "pending",
+                                )
+                              }
+                            >
+                              <Send className="mr-1.5 h-3.5 w-3.5 text-emerald-700" />
+                              {isAdmin ? "Publish" : "Submit"}
+                            </Button>
+                          )}
+
+                          {isAdmin && property.status !== "draft" && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  disabled={busy}
+                                  onClick={() => void changeStatus(property)}
+                                >
+                                  {property.status === "approved" ? (
+                                    <X className="h-4 w-4 text-amber-600" />
+                                  ) : (
+                                    <Check className="h-4 w-4 text-emerald-600" />
+                                  )}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                {property.status === "approved"
+                                  ? "Unpublish"
+                                  : "Approve"}
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
+
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8"
+                                onClick={() => void openPreview(property._id)}
+                              >
+                                <Eye className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Preview</TooltipContent>
+                          </Tooltip>
+
+                          {/*
+                            Edit and Delete used to be admin-only here. The
+                            dashboard list is owner-scoped and the API checks
+                            ownership on both routes, so every row an agent can
+                            see is one they are allowed to change — hiding the
+                            buttons just meant going the long way round.
+                          */}
+                          {true && (
+                            <>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    asChild
+                                  >
+                                    <Link
+                                      href={`/dashboard/property/edit/${property._id}`}
+                                    >
+                                      <SquarePen className="h-4 w-4" />
+                                      <span className="sr-only">Edit</span>
+                                    </Link>
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Edit</TooltipContent>
+                              </Tooltip>
+
+                              {!isAgent && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    disabled={busy}
+                                    onClick={() => requestDelete(property)}
+                                  >
+                                    <Trash2 className="h-4 w-4 text-destructive" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Delete</TooltipContent>
+                              </Tooltip>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
+              )}
+            </TableBody>
+          </Table>
+        </div>
+
+        {!table.loading && !table.error && table.matchedCount > 0 && (
+          <div className="p-5 pt-0">
+            <PaginationBar
+              page={table.page}
+              totalPages={table.totalPages}
+              pageSize={table.pageSize}
+              fromIndex={table.fromIndex}
+              toIndex={table.toIndex}
+              matchedCount={table.matchedCount}
+              itemLabel="properties"
+              onPageChange={table.setPage}
+              onPageSizeChange={table.setPageSize}
+            />
+          </div>
+        )}
+      </DataCard>
+
+      <Dialog open={!!assigning} onOpenChange={(o) => !o && setAssigning(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Give this listing to</DialogTitle>
+            <DialogDescription className="line-clamp-2">{assigning?.property.title}</DialogDescription>
+          </DialogHeader>
+          {assigning && (
+            <Select value={assigning.to} onValueChange={(to) => setAssigning({ ...assigning, to })}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="me">Me (agency owner)</SelectItem>
+                {team.map((m) => (
+                  <SelectItem key={m._id} value={m._id}>
+                    {m.name}
+                    {m.isActive ? "" : " (paused)"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setAssigning(null)}>
+              Cancel
+            </Button>
+            <Button onClick={() => void assignTo()} disabled={!assigning || busyId === assigning.property._id}>
+              Give listing
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <PropertyPreviewDialog
+        property={preview}
+        open={previewOpen}
+        onOpenChange={setPreviewOpen}
+        loading={previewLoading && !preview}
+        canEdit
+      />
+
+      <ConfirmDialog {...dialogProps} />
+    </div>
+  );
+}

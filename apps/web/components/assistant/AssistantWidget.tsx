@@ -1,0 +1,885 @@
+"use client";
+
+/**
+ * The site assistant: a chat button in the corner that opens a chat window
+ * (full screen on phones).
+ *
+ * The common jobs run straight from buttons and short forms — no model, no
+ * waiting: find a property (one form: city, area, type, size, budget, beds),
+ * area rents and dealers. Their answers are
+ * visual cards that can be adjusted in place. Anything typed goes to the
+ * model, which uses the same lookups and the same cards.
+ */
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { ArrowDown, ArrowUp, BarChart3, BedDouble, Headset, Check, ChevronDown, ChevronRight, Copy, Home, KeyRound, Loader2, PlusCircle, RotateCcw, Square, Users, X } from "lucide-react";
+import { useSiteSettings } from "@/components/SiteSettingsProvider";
+import { cn } from "@/lib/utils";
+import type { QuickRequest, Visual } from "@/lib/assistant/types";
+import Launcher from "./Launcher";
+import { SupportCard, AgentsCard, GuidesCard, ListingsCard, MarketCard, MarketForm, SearchForm, sizeLabel } from "./AssistantCards";
+import { SEARCH_INTRO, TALK_TO_TEAM, chipsFor, localRoute, searchForm, wantsPerson, type Action, type Chip } from "./suggest";
+import { resolved, waDigits } from "@/lib/site-settings";
+import { refusal } from "@/lib/assistant/guard";
+
+type Msg = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  cards?: Visual[];
+  /** The request behind each card, so a card can be adjusted in place. */
+  reqs?: (QuickRequest | null)[];
+  chips?: Chip[];
+  status?: string;
+  /** What the assistant looked up on the way, shown as steps. */
+  steps?: string[];
+  error?: boolean;
+  /** Links the lookups returned for this reply — the only ones shown as links (besides the fixed pages). */
+  links?: string[];
+  /** The question to send again from a "Try again" button. */
+  retry?: string;
+  done?: boolean;
+  busyCard?: number;
+};
+
+const LS = "pd_assistant_v4";
+const SEEN = "pd_assistant_seen";
+const newId = () => Math.random().toString(36).slice(2, 10);
+
+const GREETING = "Assalam-o-Alaikum! How can we help you today?";
+
+
+const START: { title: string; icon: React.ComponentType<{ className?: string }>; action: Action }[] = [
+  { title: "Find a house or portion", icon: Home, action: { type: "form", card: searchForm({ purpose: "rent", type: "house" }), say: "Find a house or portion for rent", intro: SEARCH_INTRO } },
+  { title: "Find a flat", icon: KeyRound, action: { type: "form", card: searchForm({ purpose: "rent", type: "flat" }), say: "Find a flat for rent", intro: SEARCH_INTRO } },
+  { title: "Find a room or hostel", icon: BedDouble, action: { type: "form", card: searchForm({ purpose: "rent", type: "room" }), say: "Find a room for rent", intro: SEARCH_INTRO } },
+  { title: "Typical rent in an area", icon: BarChart3, action: { type: "form", card: { kind: "form", form: "market" }, say: "Typical rent in an area", intro: "Which area would you like to check?" } },
+  { title: "Find a property dealer", icon: Users, action: { type: "quick", req: { tool: "find_agents", args: { city: "Lahore" } }, say: "Property dealers in Lahore" } },
+  { title: "Let our team find a rental for you", icon: Headset, action: { type: "link", href: "/find-property-for-me" } },
+  { title: "List my property for rent", icon: PlusCircle, action: { type: "link", href: "/dashboard/property/add-property" } },
+];
+
+/* ── text helpers ───────────────────────────────────────────────────────── */
+
+/** Pulls the `[[A | B]]` choices out of a reply and strips them (and any half-typed one) from the text. */
+function splitChoices(text: string): { body: string; choices: string[] } {
+  const choices: string[] = [];
+  const seen = new Set<string>();
+  const re = /\[\[([^\]]+)\]\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    for (const part of m[1]!.split("|")) {
+      const c = part.trim().replace(/^[-•·*]+\s*|\s*[-•·*]+$/g, "");
+      if (c && c.length <= 60 && !seen.has(c.toLowerCase())) {
+        seen.add(c.toLowerCase());
+        choices.push(c);
+      }
+    }
+  }
+  const body = text
+    .replace(/\[\[[^\]]*\]\]/g, "")
+    .replace(/\[\[[^\]]*$/, "")
+    .replace(/(?:^|\n)\s*(?:choose one to proceed|select an option|options)\s*:?\s*(?=\n|$)/gi, "\n")
+    .replace(/[\s·•|]+$/g, "")
+    .trim();
+  return { body, choices: choices.slice(0, 5) };
+}
+
+/* Safe inline markdown: **bold**, [links](/path). */
+function inline(text: string, key: string) {
+  const out: React.ReactNode[] = [];
+  const re = /\*\*([^*]+)\*\*|\[([^\]]+)\]\(([^)\s]+)\)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let i = 0;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1]) out.push(<strong key={`${key}b${i++}`} className="font-semibold text-slate-900">{m[1]}</strong>);
+    else {
+      const href = m[3]!;
+      // A link no lookup returned (made up, or mistyped): show the words, not a link that may 404.
+      if (!linkOk(href)) out.push(<span key={`${key}l${i++}`} className="font-medium">{m[2]}</span>);
+      else if (href.startsWith("/") && !href.startsWith("//")) out.push(<Link key={`${key}l${i++}`} href={href} className="font-medium text-primary underline decoration-primary/30 underline-offset-2 hover:decoration-primary">{m[2]}</Link>);
+      else if (/^https?:\/\//.test(href)) out.push(<a key={`${key}l${i++}`} href={href} target="_blank" rel="noopener noreferrer" className="font-medium text-primary underline decoration-primary/30 underline-offset-2">{m[2]}</a>);
+      else out.push(m[2]);
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+const cells = (line: string) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+const isSep = (line: string) => {
+  const t = line.trim();
+  if (!t.includes("|") || !t.includes("-")) return false;
+  const c = cells(t);
+  return c.length >= 2 && c.every((x) => /^:?-{2,}:?$/.test(x));
+};
+
+/** The site's fixed pages: always safe to link. Anything else must have come from a lookup. */
+const FIXED_PAGES = /^\/(?:|properties\/rent(?:\/(?:house|upper-portion|lower-portion|flat|apartment|room|hostel|shop|office|warehouse|commercial))?|blog|contact|about|packages|find-property-for-me|property-dealers|privacy-policy|terms|dashboard\/property\/add-property)\/?$/;
+
+/** Links in this reply that are real: fixed pages, or ones a lookup returned. */
+let allowedLinks: Set<string> | null = null;
+function linkOk(href: string): boolean {
+  const path = href.replace(/[?#].*$/, "");
+  if (FIXED_PAGES.test(path)) return true;
+  if (!allowedLinks) return false;
+  return allowedLinks.has(href) || allowedLinks.has(path) || [...allowedLinks].some((l) => l.replace(/[?#].*$/, "") === path);
+}
+
+function Markdown({ text, links }: { text: string; links?: string[] }) {
+  allowedLinks = new Set(links || []);
+  const blocks: React.ReactNode[] = [];
+  let list: string[] = [];
+  const lines = text.replace(/\r/g, "").split("\n");
+  const flush = () => {
+    if (!list.length) return;
+    const k = blocks.length;
+    blocks.push(
+      <ul key={`u${k}`} className="my-1.5 space-y-1 pl-4 [&>li]:relative [&>li]:before:absolute [&>li]:before:-left-3 [&>li]:before:top-[0.6em] [&>li]:before:h-1 [&>li]:before:w-1 [&>li]:before:rounded-full [&>li]:before:bg-slate-400">
+        {list.map((it, i) => <li key={i}>{inline(it, `u${k}_${i}`)}</li>)}
+      </ul>,
+    );
+    list = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!;
+    const t = raw.trim();
+    if (t.includes("|") && i + 1 < lines.length && isSep(lines[i + 1]!)) {
+      flush();
+      const head = cells(t);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i]!.trim().includes("|")) {
+        if (!isSep(lines[i]!)) rows.push(cells(lines[i]!));
+        i++;
+      }
+      i--;
+      const k = blocks.length;
+      blocks.push(
+        <div key={`t${k}`} className="my-2 overflow-x-auto rounded-xl border border-slate-200 bg-white">
+          <table className="w-full border-collapse text-left text-[14.5px] sm:text-[14px]">
+            <thead>
+              <tr className="bg-slate-50 text-[12.5px] font-semibold uppercase tracking-wide text-slate-500">
+                {head.map((h, hi) => <th key={hi} className="whitespace-nowrap px-3 py-2">{inline(h, `th${k}_${hi}`)}</th>)}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {rows.map((r, ri) => (
+                <tr key={ri}>
+                  {head.map((_, ci) => <td key={ci} className={cn("px-3 py-2 align-top text-slate-800", ci > 0 && "whitespace-nowrap font-medium")}>{inline(r[ci] ?? "", `td${k}_${ri}_${ci}`)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+    const b = /^\s*(?:[-*•]|\d+[.)])\s+(.*)$/.exec(raw);
+    if (b) {
+      list.push(b[1]!);
+      continue;
+    }
+    flush();
+    if (!t || /^-{3,}$/.test(t)) continue;
+    if (/^#{1,4}\s+/.test(t)) blocks.push(<p key={`h${i}`} className="mb-1 mt-2.5 font-semibold text-slate-900">{inline(t.replace(/^#{1,4}\s+/, ""), `h${i}`)}</p>);
+    else blocks.push(<p key={`p${i}`} className="my-1.5">{inline(t, `p${i}`)}</p>);
+  }
+  flush();
+  return <div dir="auto" className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">{blocks}</div>;
+}
+
+/* ── what to say and offer after a card ─────────────────────────────────── */
+
+function summarize(card: Visual | null): string {
+  if (!card) return "Sorry, I couldn't load that right now. Please try again.";
+  const a: Record<string, any> = card.q || {};
+  switch (card.kind) {
+    case "listings": {
+      if (!card.total) return "Nothing matches all of that right now. Try a higher budget, any size, or a nearby area — or let our team find it for you.";
+      if (card.note) return `${card.note} Our team can also search for you.`;
+      const what = "for rent";
+      const one = Array.isArray(a.types) && a.types.length === 1 ? String(a.types[0]) : "property";
+      const word = card.total === 1 ? one : one === "property" ? "properties" : `${one}s`;
+      return `Found **${card.total.toLocaleString("en-PK")}** ${word} ${what}${card.label ? ` in ${card.label}` : ""}${card.priceRange && card.total > 1 ? `, mostly **${card.priceRange.min}** to **${card.priceRange.max}**` : ""}.`;
+    }
+    case "market": {
+      const m = card.market.find((x) => x.listings > 0);
+      const size = a.min_marla && a.min_marla === a.max_marla ? `${sizeLabel(a.min_marla)} ` : "";
+      const type = Array.isArray(a.types) && a.types.length === 1 ? String(a.types[0]) : "property";
+      return m
+        ? `A typical ${size}${type} in ${card.place} rents for **${m.median}** a month${m.perMarla && !size ? ` — about **${m.perMarla}** per marla` : ""}.`
+        : `There aren't enough live rentals in ${card.place} yet to show typical rents.`;
+    }
+    case "agents":
+      if (card.query)
+        return card.exact
+          ? `Yes — ${card.exact === 1 ? "there is a dealer" : `there are ${card.exact} dealers`} named **${card.query}**${card.city ? ` in ${card.city}` : ""} on the site.`
+          : card.items.length
+            ? `No dealer is named exactly **${card.query}**, but these names are close — is one of them who you mean?`
+            : `No, there's no dealer named **${card.query}** on the site${card.city ? ` in ${card.city}` : ""}. Check the spelling, or browse all dealers.`;
+      return card.items.length ? `Property dealers in ${card.city}, verified ones first. Open a profile to see their listings and contact them.` : `No dealers are listed in ${card.city} yet.`;
+    case "guides":
+      return "These guides on the site explain it step by step.";
+    case "form":
+      return card.form === "search" ? "Which city or area? I've filled in the rest — just pick the place." : "";
+    default:
+      return "";
+  }
+}
+
+const QUICK_STEP: Record<string, string> = {
+  search_listings: "Searching live listings",
+  smart_search: "Searching live listings",
+  market_prices: "Reading rents from live listings",
+  find_agents: "Finding dealers",
+};
+
+/** A few words about the cards a reply showed — what the AI needs to follow up on them. */
+function cardNotes(cards?: Visual[]): string {
+  if (!cards?.length) return "";
+  const notes = cards.map((c) => {
+    switch (c.kind) {
+      case "listings":
+        return `[Shown ${c.total} listing(s)${c.label ? ` in ${c.label}` : ""}${c.note ? ` (${c.note})` : ""}: ${c.items
+          .slice(0, 5)
+          .map((l, i) => `${i + 1}) ${l.title} — ${l.priceText} — ${l.size || ""} — ${l.place} — ${l.url}`)
+          .join("; ")}]`;
+      case "market":
+        return `[Shown prices for ${c.place}: ${c.market
+          .filter((m) => m.listings)
+          .map((m) => `${m.purpose} median ${m.median}, per marla ${m.perMarla || "-"}, by size ${(m.bySize || []).map((b) => `${b.size} ${b.median}`).join(", ")}`)
+          .join(" | ")}]`;
+      case "agents":
+        return `[Shown dealers${c.query ? ` named “${c.query}”` : c.city ? ` in ${c.city}` : ""}: ${c.items.slice(0, 6).map((d) => `${d.name}${d.city ? ` (${d.city})` : ""}`).join(", ") || "none"}]`;
+      case "guides":
+        return `[Shown articles: ${c.items.map((g) => `${g.title} ${g.url}`).join("; ")}]`;
+      case "support":
+        return "[Shown the team's WhatsApp/call card]";
+      case "form":
+        return `[Shown a ${c.form} form]`;
+      default:
+        return "";
+    }
+  });
+  return notes.filter(Boolean).join("\n").slice(0, 1200);
+}
+
+/* ── the window ─────────────────────────────────────────────────────────── */
+
+
+/** What the assistant did to answer, like a short work log. */
+function Steps({ steps, running }: { steps: string[]; running: boolean }) {
+  return (
+    <ul className="space-y-1 text-[13.5px] text-slate-500" aria-live="polite">
+      {steps.map((st, i) => {
+        const active = running && i === steps.length - 1;
+        return (
+          <li key={i} className="flex items-center gap-2">
+            {active ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /> : <Check className="h-3.5 w-3.5 shrink-0 text-emerald-600" />}
+            <span className={cn(active && "text-slate-700")}>{st}</span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+const Dots = ({ label }: { label?: string }) => (
+  <div className="inline-flex items-center gap-2 py-1 text-[14px] text-slate-500" aria-live="polite">
+    <span className="flex gap-1">
+      {[0, 1, 2].map((d) => <span key={d} className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400" style={{ animationDelay: `${d * 0.15}s` }} />)}
+    </span>
+    {label && <span>{label}…</span>}
+  </div>
+);
+
+export default function AssistantWidget() {
+  const pathname = usePathname() || "/";
+  const router = useRouter();
+  const settings = useSiteSettings();
+  const site = settings as { siteName?: string };
+  const brand = site?.siteName || "Rent Ghar";
+  const contact = resolved(settings);
+  const teamWhatsapp = contact.whatsapp ? waDigits(contact.whatsapp) : "";
+  const siteIcon = (settings as { faviconUrl?: string }).faviconUrl || "/api/push/icon.png";
+  const [open, setOpen] = useState(false);
+  const [msgs, setMsgs] = useState<Msg[]>([]);
+  /** The messages as of now, for code that runs after a state change in the same tick. */
+  const msgsRef = useRef<Msg[]>([]);
+  msgsRef.current = msgs;
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [teaser, setTeaser] = useState(false);
+  const abort = useRef<AbortController | null>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
+  /** Scrolled up to read something: offer a button back to the latest message. */
+  const [away, setAway] = useState(false);
+  const [copied, setCopied] = useState("");
+  const stick = useRef(true);
+  /** Which edge the chat button is on — the chat window opens on that side (desktop). */
+  const [launcherSide, setLauncherSide] = useState<"left" | "right">("right");
+  /** The AI answered "not set up": use the quick rules for typed questions. */
+  const aiDown = useRef(false);
+  /** A form just appeared: show it from its top, not its bottom. */
+  const showTop = useRef<string | null>(null);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS) || "[]");
+      if (Array.isArray(saved)) setMsgs(saved.filter((m) => m?.role && typeof m.text === "string").map((m) => ({ ...m, status: undefined, busyCard: undefined, done: true })));
+    } catch {
+      /* private mode */
+    }
+  }, []);
+  useEffect(() => {
+    if (busy) return;
+    try {
+      localStorage.setItem(LS, JSON.stringify(msgs.slice(-30)));
+    } catch {
+      /* private mode */
+    }
+  }, [msgs, busy]);
+
+  // A short note beside the button, once, a little after the first visit.
+  useEffect(() => {
+    let seen = true;
+    try {
+      seen = !!localStorage.getItem(SEEN);
+    } catch {
+      /* private mode */
+    }
+    if (seen) return;
+    const t = setTimeout(() => setTeaser(true), 10000);
+    return () => clearTimeout(t);
+  }, []);
+  const markSeen = () => {
+    setTeaser(false);
+    try {
+      localStorage.setItem(SEEN, "1");
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    markSeen();
+    if (window.matchMedia("(min-width: 640px)").matches) setTimeout(() => box.current?.focus(), 120);
+    else document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // Follow new content, unless the reader scrolled up to look at something.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    if (showTop.current) {
+      const target = el.querySelector<HTMLElement>(`[data-mid="${showTop.current}"]`);
+      showTop.current = null;
+      if (target) {
+        stick.current = false;
+        el.scrollTo({ top: target.offsetTop - 12, behavior: "smooth" });
+        return;
+      }
+    }
+    if (stick.current) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [msgs, open]);
+  const onScroll = () => {
+    const el = scroller.current;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    setAway(!stick.current);
+  };
+
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }, [input, open]);
+
+  const copy = async (id: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text.replace(/\*\*/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1"));
+      setCopied(id);
+      setTimeout(() => setCopied((c) => (c === id ? "" : c)), 1500);
+    } catch {
+      /* clipboard blocked */
+    }
+  };
+
+  const update = (id: string, fn: (m: Msg) => Msg) => setMsgs((all) => all.map((m) => (m.id === id ? fn(m) : m)));
+
+  const quickFetch = async (req: QuickRequest): Promise<Visual | null> => {
+    // A dropped connection (phones switching networks) is tried again, twice, before giving up.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetch("/assistant/quick", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) });
+        const j = await res.json().catch(() => null);
+        if (res.ok || res.status < 500 || attempt >= 2) return res.ok && j?.card ? (j.card as Visual) : null;
+      } catch (e) {
+        if (attempt >= 2) throw e;
+      }
+      await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+    }
+  };
+
+  /** Runs a lookup directly and shows its card. */
+  const runQuick = useCallback(
+    async (req: QuickRequest, say: string) => {
+      if (busy) return;
+      stick.current = true;
+      const reply: Msg = { id: newId(), role: "assistant", text: "", status: "Loading", steps: [QUICK_STEP[req.tool] || "Looking it up"] };
+      setMsgs((all) => [...all, { id: newId(), role: "user", text: say, done: true }, reply]);
+      setBusy(true);
+      try {
+        const card = await quickFetch(req);
+        update(reply.id, (m) => ({ ...m, text: summarize(card), cards: card ? [card] : [], reqs: [req], chips: chipsFor(card), error: !card, status: undefined, done: true }));
+      } catch {
+        update(reply.id, (m) => ({ ...m, text: "The connection dropped. Please check your internet and try again.", error: true, status: undefined, done: true }));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy],
+  );
+
+  /** Re-runs one card with changed options (size, type, city…) in place. */
+  const refreshCard = async (msgId: string, idx: number, req: QuickRequest) => {
+    update(msgId, (m) => ({ ...m, busyCard: idx }));
+    try {
+      const card = await quickFetch(req);
+      update(msgId, (m) => {
+        if (!card) return { ...m, busyCard: undefined };
+        const cards = [...(m.cards || [])];
+        const reqs = [...(m.reqs || [])];
+        cards[idx] = card;
+        reqs[idx] = req;
+        return { ...m, cards, reqs, busyCard: undefined, text: m.chips ? summarize(card) : m.text, chips: m.chips ? chipsFor(card) : m.chips };
+      });
+    } catch {
+      update(msgId, (m) => ({ ...m, busyCard: undefined }));
+    }
+  };
+
+  const showForm = (card: Visual, say: string, intro: string) => {
+    const user: Msg = { id: newId(), role: "user", text: say, done: true };
+    showTop.current = user.id;
+    setMsgs((all) => [...all, user, { id: newId(), role: "assistant", text: intro, cards: [card], done: true }]);
+  };
+
+  /** Free text goes to the model. */
+  const send = useCallback(
+    async (textIn?: string) => {
+      const text = (textIn ?? input).trim();
+      if (!text || busy) return;
+      setInput("");
+      // Requests that must not be answered (bulk numbers, personal details, spam…): a polite no, nothing sent anywhere.
+      const no = refusal(text);
+      if (no) {
+        stick.current = true;
+        setMsgs((all) => [...all, { id: newId(), role: "user", text, done: true }, { id: newId(), role: "assistant", text: no, done: true }]);
+        return;
+      }
+      // "I want to talk to a person": the team's WhatsApp, at once.
+      if (wantsPerson(text)) {
+        stick.current = true;
+        setMsgs((all) => [
+          ...all,
+          { id: newId(), role: "user", text, done: true },
+          { id: newId(), role: "assistant", text: "Of course — here's how to reach our team. WhatsApp is the quickest.", cards: [{ kind: "support", topic: lastTopic() }], done: true },
+        ]);
+        return;
+      }
+      // Typed messages go to the AI: it understands the question and looks things up itself.
+      // (The quick rules below are only the fallback for when the AI isn't available.)
+      if (aiDown.current) {
+        const local = localRoute(text);
+        if (local) return void runQuick(local, text);
+      }
+      stick.current = true;
+      const user: Msg = { id: newId(), role: "user", text, done: true };
+      const reply: Msg = { id: newId(), role: "assistant", text: "", status: "Typing" };
+      const history = [...msgsRef.current, user];
+      setMsgs([...history, reply]);
+      setBusy(true);
+      const ctrl = new AbortController();
+      abort.current = ctrl;
+      const payload = JSON.stringify({
+        // Each reply carries a short note of the cards it showed, so "is wali ka price?" or "inme se sasta?" make sense to the AI.
+        messages: [
+          { role: "assistant", content: GREETING },
+          ...history
+            .filter((m) => (m.text || m.cards?.length) && !m.error)
+            .map((m) => ({ role: m.role, content: [m.text, m.role === "assistant" ? cardNotes(m.cards) : ""].filter(Boolean).join("\n") })),
+        ],
+        page: pathname,
+      });
+      let received = false; // any part of the answer arrived
+      let finished = false; // the server said it was done
+      try {
+        // Phones drop connections (switching apps, weak signal). If nothing has arrived yet,
+        // ask again quietly — up to two more times — before showing an error.
+        for (let attempt = 0; attempt < 3 && !finished; attempt++) {
+          if (attempt) {
+            update(reply.id, (m) => ({ ...m, status: "Reconnecting" }));
+            await new Promise((r) => setTimeout(r, 800 * attempt));
+            if (ctrl.signal.aborted) return;
+          }
+          try {
+            const res = await fetch("/assistant/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload, signal: ctrl.signal });
+            if (!res.ok || !res.body) {
+              // The AI isn't set up / unavailable: answer what the quick rules can, from now on.
+              if (res.status === 503) {
+                aiDown.current = true;
+                const local = localRoute(text);
+                if (local) {
+                  setMsgs((all) => all.filter((m) => m.id !== reply.id && m.id !== user.id));
+                  setBusy(false);
+                  abort.current = null;
+                  setTimeout(() => void runQuick(local, text), 0);
+                  return;
+                }
+              }
+              if (res.status >= 500 && attempt < 2) continue;
+              const j = await res.json().catch(() => ({}));
+              update(reply.id, (m) => ({ ...m, text: j?.error || "Sorry, I couldn't answer that just now. Please try again.", error: true, retry: res.status === 429 ? undefined : text, status: undefined, done: true }));
+              return;
+            }
+            const reader = res.body.getReader();
+            const dec = new TextDecoder();
+            let buf = "";
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += dec.decode(value, { stream: true });
+              let i: number;
+              while ((i = buf.indexOf("\n")) >= 0) {
+                const line = buf.slice(0, i);
+                buf = buf.slice(i + 1);
+                if (!line.trim()) continue;
+                let ev: any;
+                try {
+                  ev = JSON.parse(line);
+                } catch {
+                  continue;
+                }
+                if (ev.t === "ping") continue;
+                if (ev.t === "links") {
+                  update(reply.id, (m) => ({ ...m, links: Array.isArray(ev.links) ? ev.links : [] }));
+                  continue;
+                }
+                if (ev.t === "done") finished = true;
+                else if (ev.t === "text") {
+                  received = true;
+                  update(reply.id, (m) => ({ ...m, text: m.text + ev.d, status: undefined }));
+                } else if (ev.t === "reset_text") update(reply.id, (m) => ({ ...m, text: "" }));
+                else if (ev.t === "status") update(reply.id, (m) => ({ ...m, status: ev.text, steps: m.steps?.includes(ev.text) ? m.steps : [...(m.steps || []), ev.text] }));
+                else if (ev.t === "cards" && ev.cards?.kind === "form") {
+                  received = true;
+                  showTop.current = user.id;
+                  update(reply.id, (m) => ({ ...m, cards: [...(m.cards || []), ev.cards], reqs: [...(m.reqs || []), null] }));
+                } else if (ev.t === "cards" && ev.cards?.kind) {
+                  received = true;
+                  update(reply.id, (m) => ({ ...m, cards: [...(m.cards || []), ev.cards], reqs: [...(m.reqs || []), null] }));
+                } else if (ev.t === "error") {
+                  finished = true;
+                  update(reply.id, (m) => ({ ...m, text: m.text || ev.text, error: !m.text, retry: m.text ? undefined : text, status: undefined }));
+                }
+              }
+            }
+            // The stream ended without "done": the connection was cut part way.
+            if (!finished && received) finished = true; // keep what arrived; it's usable
+          } catch (e: any) {
+            if (e?.name === "AbortError" || ctrl.signal.aborted) return;
+            if (received) finished = true; // part of the answer is there: keep it, no error
+          }
+        }
+        if (!finished) update(reply.id, (m) => ({ ...m, text: "The connection dropped. Please check your internet and try again.", error: true, retry: text }));
+      } finally {
+        update(reply.id, (m) => ({ ...m, status: undefined, done: true }));
+        setBusy(false);
+        abort.current = null;
+      }
+    },
+    [input, busy, msgs, pathname, runQuick],
+  );
+
+  const act = (a: Action) => {
+    if (busy) return;
+    if (a.type === "support") {
+      stick.current = true;
+      setMsgs((all) => [...all, { id: newId(), role: "assistant", text: "Here's how to reach our team — WhatsApp is the quickest.", cards: [{ kind: "support", topic: a.topic || lastTopic() }], done: true }]);
+      return;
+    }
+    if (a.type === "link") {
+      router.push(a.href);
+      if (!window.matchMedia("(min-width: 640px)").matches) setOpen(false);
+      return;
+    }
+    if (a.type === "send") void send(a.text);
+    else if (a.type === "quick") void runQuick(a.req, a.say);
+    else showForm(a.card, a.say, a.intro);
+  };
+
+  /** What they were last asking about, to start the WhatsApp message with. */
+  const lastTopic = () => {
+    const q = [...msgsRef.current].reverse().find((m) => m.role === "user" && !wantsPerson(m.text));
+    return q?.text.slice(0, 120);
+  };
+
+  const reset = () => {
+    abort.current?.abort();
+    setMsgs([]);
+    try {
+      localStorage.removeItem(LS);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  if (pathname.startsWith("/dashboard") || pathname.includes("/checkout")) return null;
+
+  const last = msgs[msgs.length - 1];
+  const lastChips: Chip[] =
+    last?.role === "assistant" && last.done && !busy
+      ? last.chips?.length
+        ? last.chips
+        : last.error
+          ? [TALK_TO_TEAM]
+          : (() => {
+            // The model showed a card: suggest from the card itself; otherwise use the model's own options.
+            const shown = [...(last.cards || [])].reverse().find((c) => c.kind !== "form");
+            const fromCard = chipsFor(shown);
+            return fromCard.length ? fromCard : splitChoices(last.text).choices.map((c) => ({ label: c, action: { type: "send", text: c } as Action }));
+          })()
+      : [];
+
+  const renderCard = (m: Msg, c: Visual, i: number) => {
+    const req = m.reqs?.[i] || null;
+    const cardBusy = m.busyCard === i;
+    switch (c.kind) {
+      case "listings":
+        return <ListingsCard card={c} />;
+      case "market":
+        return <MarketCard card={c} />;
+      case "agents":
+        return <AgentsCard card={c} busy={cardBusy} onCity={(city) => void refreshCard(m.id, i, { tool: "find_agents", args: { city } })} />;
+      case "guides":
+        return <GuidesCard card={c} />;
+      case "support":
+        return <SupportCard topic={c.topic} whatsapp={teamWhatsapp} phone={contact.phone} site={brand} />;
+      case "form":
+        if (c.form === "search")
+          return <SearchForm prefill={c.prefill} disabled={busy} onSubmit={(s) => void runQuick({ tool: "search_listings", args: s.args }, s.say)} />;
+        return <MarketForm prefill={c.prefill} disabled={busy} onSubmit={(s) => void runQuick({ tool: "market_prices", args: s.args }, s.say)} />;
+    }
+  };
+
+  return (
+    <>
+      {/* The chat button: drag it along either edge; it stays clear of bottom bars and the phone menu. */}
+      <Launcher open={open} onToggle={() => setOpen((o) => !o)} teaser={teaser} onTeaserOpen={() => setOpen(true)} onTeaserClose={markSeen} onSide={setLauncherSide} />
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label={`Chat with ${brand}`}
+          className={cn("assistant-open fixed inset-0 z-[90] flex flex-col isolate bg-white sm:inset-auto sm:bottom-[100px]", launcherSide === "left" ? "sm:left-6" : "sm:right-6", " sm:h-[min(700px,calc(100vh-120px))] sm:w-[430px] sm:overflow-hidden sm:rounded-2xl sm:border sm:border-slate-200 sm:shadow-[0_24px_64px_-16px_rgba(15,23,42,0.35)]")}
+        >
+          <div className="flex items-center gap-2.5 bg-primary px-3.5 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] text-white">
+            {/* The site's own favicon (Settings → Appearance), in full colour on white. */}
+            <span className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-full bg-white">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={siteIcon}
+                alt=""
+                className="h-6 w-6 object-contain"
+                onError={(e) => {
+                  // The favicon file didn't load: the PNG made from it (Settings → Appearance) instead.
+                  if (!e.currentTarget.src.includes("/api/push/icon.png")) e.currentTarget.src = "/api/push/icon.png";
+                }}
+              />
+            </span>
+            <p className="min-w-0 flex-1 truncate text-[16px] font-semibold leading-tight">{brand}</p>
+            {teamWhatsapp && (
+              <button
+                type="button"
+                onClick={() => act({ type: "support" })}
+                title="Talk to our team"
+                className="inline-flex h-8 items-center gap-1.5 rounded-full bg-white/15 px-3 text-[13px] font-semibold text-white hover:bg-white/25"
+              >
+                <Headset className="h-4 w-4" />
+                <span className="max-[359px]:hidden">Talk to us</span>
+              </button>
+            )}
+            {msgs.length > 0 && (
+              <button type="button" onClick={reset} title="Start over" aria-label="Start over" className="grid h-9 w-9 place-items-center rounded-full text-white/85 hover:bg-white/15">
+                <RotateCcw className="h-[18px] w-[18px]" />
+              </button>
+            )}
+            <button type="button" onClick={() => setOpen(false)} aria-label="Close" className="grid h-9 w-9 place-items-center rounded-full text-white/85 hover:bg-white/15">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          <div ref={scroller} onScroll={onScroll} className="relative flex-1 space-y-3.5 overflow-y-auto overscroll-contain px-3 py-3.5 text-[16px] leading-relaxed text-slate-800 sm:text-[15px]">
+            <div className="px-0.5">
+              <p className="text-[17px] font-semibold text-slate-900">{GREETING}</p>
+              {msgs.length === 0 && <p className="mt-0.5 text-[14.5px] text-slate-500">Choose an option, or type your question below.</p>}
+            </div>
+            {msgs.length === 0 && (
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                {START.map((s, i) => (
+                  <button
+                    key={s.title}
+                    type="button"
+                    onClick={() => act(s.action)}
+                    className={cn("flex w-full items-center gap-3 px-3.5 py-3 text-left transition-colors hover:bg-slate-50", i > 0 && "border-t border-slate-100")}
+                  >
+                    <s.icon className="h-5 w-5 shrink-0 text-primary" />
+                    <span className="flex-1 text-[15.5px] font-medium text-slate-900">{s.title}</span>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-slate-300" />
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {msgs.map((m) => {
+              if (m.role === "user")
+                return (
+                  <div key={m.id} data-mid={m.id} className="flex justify-end">
+                    <div dir="auto" className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-white">
+                      {m.text}
+                    </div>
+                  </div>
+                );
+              const { body } = splitChoices(m.text);
+              const running = !m.done;
+              const steps = (m.steps || []).filter((st) => st !== "Typing" && st !== "Loading");
+              return (
+                <div key={m.id} data-mid={m.id} className="space-y-2.5">
+                  {steps.length > 0 && (running || !m.error) && <Steps steps={steps} running={running && !body && !m.cards?.length} />}
+                  {body && (
+                    <div className={cn("px-0.5", m.error && "rounded-lg bg-red-50 px-3 py-2 text-red-800")}>
+                      <Markdown text={body} links={m.links} />
+                      {m.error && m.retry && !busy && m.id === msgs[msgs.length - 1]?.id && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const q = m.retry!;
+                            // Drop the failed exchange and ask again.
+                            msgsRef.current = msgsRef.current.slice(0, -2);
+                            setMsgs(msgsRef.current);
+                            void send(q);
+                          }}
+                          className="mt-2 inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-3 text-[14px] font-semibold text-red-700 ring-1 ring-red-200 hover:bg-red-100"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" /> Try again
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {m.cards?.map((c, i) => <div key={i} className="assistant-pop">{renderCard(m, c, i)}</div>)}
+                  {m.done && !m.error && body && (
+                    <button
+                      type="button"
+                      onClick={() => void copy(m.id, body)}
+                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[12.5px] text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+                    >
+                      {copied === m.id ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                      {copied === m.id ? "Copied" : "Copy"}
+                    </button>
+                  )}
+                  {running && !body && !m.cards?.length && !steps.length && <Dots />}
+                </div>
+              );
+            })}
+
+            {lastChips.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {lastChips.map((c) => (
+                  <button
+                    key={c.label}
+                    type="button"
+                    dir="auto"
+                    onClick={() => act(c.action)}
+                    className="rounded-full border border-primary/25 bg-white px-3.5 py-1.5 text-left text-[14.5px] font-medium leading-snug text-primary transition-colors hover:bg-primary hover:text-white"
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {away && msgs.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                const el = scroller.current;
+                stick.current = true;
+                setAway(false);
+                el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+              }}
+              aria-label="Go to the latest message"
+              className="absolute bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 z-10 grid h-9 w-9 -translate-x-1/2 place-items-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-md hover:text-slate-900"
+            >
+              <ArrowDown className="h-4 w-4" />
+            </button>
+          )}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void send();
+            }}
+            className="border-t border-slate-200 bg-white px-3 pb-[max(0.625rem,env(safe-area-inset-bottom))] pt-2.5"
+          >
+            <div className="flex items-end gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 py-1.5 pl-3.5 pr-1.5 transition focus-within:border-primary/50 focus-within:bg-white focus-within:ring-2 focus-within:ring-primary/10">
+              <textarea
+                ref={box}
+                rows={1}
+                value={input}
+                dir="auto"
+                maxLength={1500}
+                enterKeyHint="send"
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter sends; Shift+Enter starts a new line. On phones the key adds a line and the button sends.
+                  if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+                  if (window.matchMedia("(pointer: coarse)").matches) return;
+                  e.preventDefault();
+                  void send();
+                }}
+                placeholder="Ask about rentals, rents, areas…"
+                className="max-h-[140px] min-h-[36px] flex-1 resize-none overflow-y-auto bg-transparent py-[7px] text-[16px] leading-[22px] text-slate-900 outline-none placeholder:text-slate-400"
+              />
+              {busy && abort.current ? (
+                <button type="button" onClick={() => abort.current?.abort()} aria-label="Stop" className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-800 text-white">
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                </button>
+              ) : (
+                <button type="submit" disabled={!input.trim() || busy} aria-label="Send" className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-primary text-white transition disabled:bg-slate-200 disabled:text-slate-400">
+                  <ArrowUp className="h-[18px] w-[18px]" />
+                </button>
+              )}
+            </div>
+            {input.length > 1200 && <p className="mt-1 text-right text-[12px] text-slate-400">{input.length}/1500</p>}
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+

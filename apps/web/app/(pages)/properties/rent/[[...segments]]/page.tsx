@@ -1,0 +1,301 @@
+ import PropertiesListing from '@/components/PropertiesListing';
+import { CityAgenciesBox, CityExtras } from '@/components/archive/ArchiveBoxes';
+import { Suspense } from 'react';
+import { notFound } from 'next/navigation';
+import { Metadata } from 'next';
+import { serverApi, fetchInitialListings, isNotFoundError } from '@/lib/server-api';
+import { toTitleCase } from '@/lib/utils';
+import { KNOWN_TYPES, typeTitle } from '@/lib/search';
+import { buildCollectionPageSchema } from '@/lib/schema/listing-schema';
+
+const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || 'https://rentghar.pk';
+
+/*
+ * Rendered on first visit, then served from cache; refreshed every 5 minutes
+ * and as soon as a listing changes (tag "properties"). Nothing is pre-built.
+ */
+export const revalidate = 300;
+export const dynamicParams = true;
+export function generateStaticParams() {
+  return [];
+}
+
+interface PageProps {
+  params: Promise<{ segments?: string[] }>;
+}
+
+const isMarlaSegment  = (s: string) => /^\d+marla$/i.test(s);
+const isKanalSegment  = (s: string) => /^\d+kanal$/i.test(s);
+const isSizeSegment   = (s: string) => isMarlaSegment(s) || isKanalSegment(s);
+const parseSizeToMarla = (s: string) => {
+  if (isKanalSegment(s)) return parseInt(s) * 20;
+  return parseInt(s.replace(/marla/i, ''), 10);
+};
+
+
+/** "Houses", "Upper Portions", "Flats" — a rental type as a plural heading word. */
+const PLURAL: Record<string, string> = {
+  house: 'Houses', 'upper-portion': 'Upper Portions', 'lower-portion': 'Lower Portions', flat: 'Flats',
+  apartment: 'Apartments', room: 'Rooms', hostel: 'Hostels', shop: 'Shops', office: 'Offices',
+  warehouse: 'Warehouses', commercial: 'Commercial Spaces',
+};
+const pluralType = (t: string) => PLURAL[t.toLowerCase()] ?? `${typeTitle(t)}s`;
+
+/** Canonical path; a merged duplicate's pages point at the area it was merged into. */
+function canonicalPath(segments: string[], areaData: any) {
+  const rest = segments.filter(s => !isSizeSegment(s));
+  if (areaData?.__mergedFrom && areaData.areaSlug && rest[1]) rest[1] = areaData.areaSlug;
+  return rest.join('/');
+}
+
+async function resolve(segments: string[]) {
+  if (!segments.length) {
+    return { cityData: null, citySlug: '', areaData: null, areaSlug: null, propertyType: null, marla: null };
+  }
+
+  const sizeSegment = segments.find(isSizeSegment) || null;
+  const marla       = sizeSegment ? parseSizeToMarla(sizeSegment) : null;
+  const rest        = segments.filter(s => !isSizeSegment(s));
+
+  if (rest.length >= 1 && KNOWN_TYPES.includes(rest[0]!.toLowerCase())) {
+    return { cityData: null, citySlug: '', areaData: null, areaSlug: null, propertyType: rest[0]!, marla };
+  }
+
+  const citySlug = rest[0] || '';
+  let cityData: any = null;
+  // Null for a city that does not exist; an API that is down throws (the cached page stays).
+  cityData = await serverApi.getCityByName(citySlug);
+
+  if (!cityData) {
+    return { cityData: null, citySlug, areaData: null, areaSlug: null, propertyType: null, marla };
+  }
+  if (!rest[1]) {
+    return { cityData, citySlug, areaData: null, areaSlug: null, propertyType: null, marla };
+  }
+
+  const seg2 = rest[1].toLowerCase();
+  if (KNOWN_TYPES.includes(seg2)) {
+    return { cityData, citySlug, areaData: null, areaSlug: null, propertyType: rest[1]!, marla };
+  }
+
+  let areaData: any = null;
+  try { areaData = await serverApi.getAreaBySlug(rest[1]!, cityData._id); } catch (e) { if (!isNotFoundError(e)) throw e; }
+  // A duplicate merged into another area keeps its URL, and shows that area's listings and content.
+  if (areaData?.mergedIntoSlug) {
+    try {
+      const primary = await serverApi.getAreaBySlug(areaData.mergedIntoSlug, cityData._id);
+      if (primary) areaData = { ...primary, __mergedFrom: rest[1] };
+    } catch (e) { if (!isNotFoundError(e)) throw e; /* keep the duplicate */ }
+  }
+
+  const propertyType = rest[2] && KNOWN_TYPES.includes(rest[2].toLowerCase()) ? rest[2]! : null;
+  return { cityData, citySlug, areaData, areaSlug: rest[1]!, propertyType, marla };
+}
+
+function toSizeSlug(marla: number): string {
+  return marla === 20 ? '1kanal' : `${marla}marla`;
+}
+
+function findSizeEntry(cityData: any, marla: number, purposes: string[]) {
+  const slug = toSizeSlug(marla);
+  for (const p of purposes) {
+    const entry = cityData?.sizeContents?.find(
+      (s: any) => s.size === slug && s.purpose === p
+    );
+    if (entry) return entry;
+  }
+  return null;
+}
+
+// 🆕 Area ke sizeContents mein se match dhoondhna
+function findAreaSizeEntry(areaData: any, marla: number, purposes: string[]) {
+  const slug = toSizeSlug(marla);
+  for (const p of purposes) {
+    const entry = areaData?.sizeContents?.find(
+      (s: any) => s.size === slug && s.purpose === p
+    );
+    if (entry) return entry;
+  }
+  return null;
+}
+
+export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
+  const { segments = [] } = await params;
+  const { cityData, citySlug, areaData, propertyType, marla } = await resolve(segments);
+
+  const purpose  = 'Rent';
+  const cityName = cityData ? toTitleCase(cityData.name) : citySlug ? toTitleCase(citySlug) : '';
+  const typeName = propertyType ? pluralType(propertyType) : 'Houses, Flats & Rooms';
+  const areaName = areaData ? toTitleCase(areaData.name) : null;
+  const locationStr = areaName ? `${areaName}${cityName ? `, ${cityName}` : ''}` : cityName || 'Pakistan';
+  const marlaStr = marla ? ` - ${marla >= 20 ? `${marla / 20} Kanal` : `${marla} Marla`}` : '';
+
+  if (areaData) {
+    // 🆕 area + marla size meta (highest priority)
+    if (marla) {
+      const areaSizeEntry = findAreaSizeEntry(areaData, marla, ['rent', 'all']);
+      if (areaSizeEntry?.metaTitle?.trim()) {
+        return {
+          title: areaSizeEntry.metaTitle,
+          description: areaSizeEntry.metaDescription || undefined,
+          alternates: { canonical: `/properties/rent/${canonicalPath(segments, areaData)}` },
+        };
+      }
+    }
+    return {
+      title: areaData.rentMetaTitle?.trim() || `${typeName} for ${purpose} in ${locationStr}${marlaStr} | Rent Ghar`,
+      description: areaData.rentMetaDescription?.trim() || `Find ${typeName.toLowerCase()} for ${purpose.toLowerCase()} in ${locationStr}. Compare monthly rents, see photos and contact owners and dealers directly on Rent Ghar.`,
+      alternates: { canonical: `/properties/rent/${canonicalPath(segments, areaData)}` },
+    };
+  }
+
+  if (cityData) {
+    if (marla && propertyType) {
+      const sizeEntry = findSizeEntry(cityData, marla, ['rent', 'all']);
+      if (sizeEntry?.metaTitle?.trim()) {
+        return {
+          title: sizeEntry.metaTitle,
+          description: sizeEntry.metaDescription || undefined,
+          alternates: { canonical: `/properties/rent/${segments.filter(s => !isSizeSegment(s)).join('/')}` },
+        };
+      }
+    }
+
+    const findTypeContent = (type: string) =>
+      cityData?.typeContents?.find(
+        (tc: any) => tc.propertyType.toLowerCase() === type.toLowerCase() &&
+          (tc.purpose === 'rent' || tc.purpose === 'all')
+      ) || null;
+
+    if (propertyType) {
+      const tc = findTypeContent(propertyType);
+      return {
+        title: tc?.metaTitle?.trim() || `${typeName} for ${purpose} in ${cityName}${marlaStr} | Rent Ghar`,
+        description: tc?.metaDescription?.trim() || `${typeName} for rent in ${cityName}: compare monthly rents by area and size, see photos and call owners and dealers directly on Rent Ghar.`,
+        alternates: { canonical: `/properties/rent/${segments.filter(s => !isSizeSegment(s)).join('/')}` },
+      };
+    }
+
+    return {
+      title: cityData.rentMetaTitle || `Houses, Portions, Flats & Rooms for Rent in ${cityName} | Rent Ghar`,
+      description: cityData.rentMetaDescription || `Find houses, upper and lower portions, flats, rooms and shops for rent in ${cityName}. Filter by area, size and monthly rent, and contact owners and dealers directly.`,
+      alternates: { canonical: `/properties/rent/${citySlug}` },
+    };
+  }
+
+  return {
+    title: propertyType ? `${typeName} for ${purpose} in Pakistan${marlaStr} | Rent Ghar` : `Houses, Portions, Flats & Rooms for Rent in Pakistan | Rent Ghar`,
+    description: propertyType
+      ? `${typeName} for rent across Pakistan — Lahore, Islamabad, Karachi, Rawalpindi and more. Compare monthly rents and contact owners directly on Rent Ghar.`
+      : `Every rental in one place: houses, upper and lower portions, flats, rooms, hostels, shops and offices for rent across Pakistan. Contact owners and dealers directly.`,
+    alternates: { canonical: `/properties/rent${segments.length ? `/${segments.join('/')}` : ''}` },
+  };
+}
+
+export default async function RentPage({ params }: PageProps) {
+  const { segments = [] } = await params;
+  const { cityData, citySlug, areaData, areaSlug, propertyType, marla } = await resolve(segments);
+  // An area segment that is not an area (unknown, or a hidden empty one) is a real 404, not an empty page.
+  if (cityData && areaSlug && !areaData) notFound();
+
+  const listingType = propertyType || 'all';
+  const areaId      = areaData?._id;
+  const cityName    = cityData ? toTitleCase(cityData.name) : '';
+
+  const specificContent = propertyType && cityData && !areaData
+    ? cityData?.typeContents?.find(
+        (tc: any) => tc.propertyType.toLowerCase() === propertyType.toLowerCase() &&
+          (tc.purpose === 'rent' || tc.purpose === 'all')
+      ) || null
+    : null;
+
+  const sizeEntry = marla && propertyType && cityData && !areaData
+    ? findSizeEntry(cityData, marla, ['rent', 'all'])
+    : null;
+
+  // 🆕 area + marla size content (highest priority)
+  const areaSizeEntry = marla && areaData
+    ? findAreaSizeEntry(areaData, marla, ['rent', 'all'])
+    : null;
+
+  const richDescription = areaSizeEntry?.content?.trim()
+    ? areaSizeEntry.content
+    : areaData && propertyType
+      ? undefined
+      : areaData
+        ? (areaData.rentContent?.trim() || areaData.description || undefined)
+        : sizeEntry?.content?.trim()
+          ? sizeEntry.content
+          : propertyType
+            ? (specificContent?.content?.trim() || undefined)
+            : (cityData?.rentContent || undefined);
+
+  const typeName   = propertyType ? pluralType(propertyType) : null;
+  const areaName   = areaData ? toTitleCase(areaData.name) : null;
+  const pageUrl    = `${BASE_URL}/properties/rent${segments.length ? `/${segments.join('/')}` : ''}`;
+  const pageTitle  = [
+    typeName ?? 'Properties',
+    'for Rent',
+    areaName ? `in ${areaName}, ${cityName}` : cityName ? `in ${cityName}` : 'in Pakistan',
+  ].join(' ');
+
+  // Page one of the list, rendered with the HTML (see fetchInitialListings).
+  const initial = await fetchInitialListings({
+    purpose: 'rent',
+    cityId: cityData?._id,
+    cityName: citySlug || undefined,
+    areaId,
+    type: listingType,
+    marla,
+  });
+  const schemaProperties = initial.raw.map((p: any) => ({ id: p._id, slug: p.slug, name: p.title }));
+
+  const nonSizeSegs = segments.filter(s => !isSizeSegment(s));
+  const crumbs = [
+    { name: 'Home', url: `${BASE_URL}/` },
+    { name: 'Rentals', url: `${BASE_URL}/properties/rent` },
+    ...(cityName ? [{ name: cityName, url: `${BASE_URL}/properties/rent/${citySlug}` }] : []),
+    ...(areaName ? [{ name: areaName, url: `${BASE_URL}/properties/rent/${citySlug}/${areaSlug}` }] : []),
+    ...(typeName && nonSizeSegs.length > 1 ? [{ name: typeName, url: `${BASE_URL}/properties/rent/${nonSizeSegs.join('/')}` }] : []),
+  ];
+
+  const collectionSchema = buildCollectionPageSchema({
+    url: pageUrl, title: pageTitle,
+    cityName: cityName || 'Pakistan',
+    properties: schemaProperties.map((p: any) => ({ title: p.name, url: `${BASE_URL}/properties/${p.slug || p.id}` })),
+    totalItems: schemaProperties.length,
+    crumbs,
+  });
+
+  return (
+    <>
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(collectionSchema) }} />
+      <Suspense fallback={
+        <div className="min-h-screen bg-background flex items-center justify-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
+        </div>
+      }>
+        <PropertiesListing
+          purpose="rent"
+          initialProperties={initial.properties}
+          initialTotalPages={initial.totalPages}
+          cityId={cityData?._id}
+          city={citySlug}
+          type={listingType}
+          areaId={areaId}
+          areaSlug={areaSlug || undefined}
+          useCleanUrls={true}
+          richDescription={richDescription}
+          initialMarla={marla ?? undefined}
+          sidebar={cityData ? (
+            <>
+              <CityAgenciesBox cityId={cityData?._id} cityName={toTitleCase(cityData.name)} />
+            </>
+          ) : undefined}
+          extras={cityData && !(areaData && areaSlug) ? <CityExtras citySlug={citySlug} cityId={cityData?._id} cityName={toTitleCase(cityData.name)} /> : undefined}
+          heading={pageTitle}
+        />
+      </Suspense>
+    </>
+  );
+}

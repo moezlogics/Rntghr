@@ -1,0 +1,245 @@
+import { TOOL_DEFS, runTool, toolLabel } from "@/lib/assistant/tools";
+import { systemPrompt } from "@/lib/assistant/prompt";
+import { refusal } from "@/lib/assistant/guard";
+
+/**
+ * POST /assistant/chat — the site assistant.
+ *
+ * Takes the conversation, lets the model look things up with the tools in
+ * lib/assistant/tools.ts (live rentals, rents, areas, dealers), and
+ * streams back newline-delimited JSON events as they happen:
+ *
+ *   {"t":"status","text":"Searching listings"}      a tool is running
+ *   {"t":"cards","cards":{...}}                     listing cards to show
+ *   {"t":"text","d":"…"}                            the answer, piece by piece
+ *   {"t":"done"} | {"t":"error","text":"…"}
+ *
+ * Any OpenAI-compatible model works; set in the server environment:
+ *   AI_ASSISTANT_API_KEY   (falls back to OPENAI_API_KEY)
+ *   AI_ASSISTANT_MODEL     default gpt-5-nano
+ *   AI_ASSISTANT_BASE_URL  default https://api.openai.com/v1 (DeepSeek: https://api.deepseek.com)
+ *   AI_ASSISTANT_REASONING default minimal (GPT-5 models: minimal | low | medium)
+ *   AI_ASSISTANT_DAILY_LIMIT  messages per visitor per day, default 60
+ */
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const KEY = process.env.AI_ASSISTANT_API_KEY || process.env.OPENAI_API_KEY || "";
+const MODEL = process.env.AI_ASSISTANT_MODEL || "gpt-5-nano";
+const BASE = (process.env.AI_ASSISTANT_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+// "low": a little thinking before answering — it understands questions and picks the right lookup far
+// better than "minimal", for a fraction of a rupee more per answer. Set AI_ASSISTANT_REASONING=minimal to save more.
+const REASONING = process.env.AI_ASSISTANT_REASONING || "low";
+const DAILY = Number(process.env.AI_ASSISTANT_DAILY_LIMIT || 60);
+const isReasoningModel = /^(gpt-5|o\d)/i.test(MODEL);
+
+/* Per-visitor daily limit (this process; enough to stop one person running up the bill). */
+const usage = new Map<string, { day: string; n: number }>();
+function allowed(ip: string): boolean {
+  const day = new Date().toISOString().slice(0, 10);
+  const u = usage.get(ip);
+  if (!u || u.day !== day) {
+    usage.set(ip, { day, n: 1 });
+    if (usage.size > 50_000) usage.delete(usage.keys().next().value as string);
+    return true;
+  }
+  u.n += 1;
+  return u.n <= DAILY;
+}
+
+type Msg = { role: "system" | "user" | "assistant" | "tool"; content: string | null; tool_calls?: any[]; tool_call_id?: string };
+
+/** One streamed call to the model. Text goes to `onText` as it arrives; tool calls are collected. */
+/** A question about property data: the first answer must come from a lookup, not from memory. */
+const NEEDS_DATA =
+  /\b(marla|marle|kanal|crore|cr|lakh|lac|price|prices|qeemat|keemat|kimat|house|houses|ghar|flat|flats|apartment|portion|room|rooms|hostel|shop|office|warehouse|rent|kiraya|dealer|dealers|agent|agents|dha|bahria|phase|block|sector|town|listing|listings)\b/i;
+
+async function complete(messages: Msg[], onText: (d: string) => void, onResetText: () => void, signal: AbortSignal, toolChoice: "auto" | "required" = "auto") {
+  // The model service sometimes answers 429/5xx for a moment: try once more before giving up.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await completeOnce(messages, onText, onResetText, signal, toolChoice);
+    } catch (e: any) {
+      const status = Number(/model (\d+)/.exec(String(e?.message))?.[1] || 0);
+      if (attempt >= 1 || signal.aborted || !(status === 429 || status >= 500 || !status)) throw e;
+      await new Promise((r) => setTimeout(r, 900));
+    }
+  }
+}
+
+async function completeOnce(messages: Msg[], onText: (d: string) => void, onResetText: () => void, signal: AbortSignal, toolChoice: "auto" | "required") {
+  const res = await fetch(`${BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
+    signal,
+    body: JSON.stringify({
+      model: MODEL,
+      messages,
+      tools: TOOL_DEFS,
+      tool_choice: toolChoice,
+      stream: true,
+      ...(isReasoningModel ? { reasoning_effort: REASONING, max_completion_tokens: 1400 } : { max_tokens: 700, temperature: 0.3 }),
+    }),
+  });
+  if (!res.ok || !res.body) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`model ${res.status}: ${detail.slice(0, 300)}`);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let text = "";
+  let hasToolCalls = false;
+  const calls: { id: string; name: string; args: string }[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i: number;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;
+      let j: any;
+      try {
+        j = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      const delta = j.choices?.[0]?.delta;
+      if (!delta) continue;
+      if (delta.tool_calls?.length) {
+        if (!hasToolCalls && text) onResetText();
+        hasToolCalls = true;
+      }
+      if (delta.content && !hasToolCalls) {
+        text += delta.content;
+        onText(delta.content);
+      }
+      for (const tc of delta.tool_calls || []) {
+        const k = tc.index ?? 0;
+        calls[k] ??= { id: "", name: "", args: "" };
+        if (tc.id) calls[k].id = tc.id;
+        if (tc.function?.name) calls[k].name += tc.function.name;
+        if (tc.function?.arguments) calls[k].args += tc.function.arguments;
+      }
+    }
+  }
+  const finalCalls = calls.filter(Boolean);
+  if (finalCalls.length && text) onResetText();
+  return { text: finalCalls.length ? "" : text, calls: finalCalls };
+}
+
+export async function POST(req: Request) {
+  if (!KEY) return Response.json({ error: "The assistant is not set up yet." }, { status: 503 });
+  const ip = (req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "local").split(",")[0]!.trim();
+  if (!allowed(ip)) return Response.json({ error: "You've reached today's limit for the assistant. Please try again tomorrow." }, { status: 429 });
+
+  const body = await req.json().catch(() => null);
+  const history: { role: string; content: string }[] = Array.isArray(body?.messages) ? body.messages : [];
+  // The last 8 turns, plain text only, each capped (older replies shorter still,
+  // tables and all) — enough context to follow the conversation, a small bill.
+  const kept = history
+    .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+    .slice(-8);
+  const turns: Msg[] = kept.map((m, i) => ({
+    role: m.role as "user" | "assistant",
+    content: m.content.replace(/\[\[[^\]]*\]\]/g, "").trim().slice(0, m.role === "user" ? 600 : i >= kept.length - 2 ? 1600 : 500) || "(options shown)",
+  }));
+  if (!turns.length || turns[turns.length - 1]!.role !== "user") return Response.json({ error: "Say something first." }, { status: 400 });
+
+  // Bulk numbers, personal details, spam, fraud, prompt tricks: answered here, the model never sees them.
+  const no = refusal(turns[turns.length - 1]!.content as string);
+  if (no) {
+    return new Response(JSON.stringify({ t: "text", d: no }) + "\n" + JSON.stringify({ t: "done" }) + "\n", {
+      headers: { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
+  const page = typeof body?.page === "string" ? body.page.slice(0, 200) : "";
+  const messages: Msg[] = [{ role: "system", content: systemPrompt(page) }, ...turns];
+
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const abort = new AbortController();
+      let closed = false;
+      // The visitor may have gone (closed the chat, lost signal): stop writing, stop the model.
+      const send = (o: unknown) => {
+        if (closed) return;
+        try {
+          controller.enqueue(enc.encode(JSON.stringify(o) + "\n"));
+        } catch {
+          closed = true;
+          abort.abort();
+        }
+      };
+      req.signal.addEventListener("abort", () => {
+        closed = true;
+        abort.abort();
+      });
+      // A small line every few seconds while it thinks or looks things up, so no proxy or
+      // mobile network decides the connection has gone quiet and drops it.
+      const ping = setInterval(() => send({ t: "ping" }), 5000);
+      const lastUser = String(turns[turns.length - 1]?.content || "");
+      // Every link the lookups returned this time: the only ones the window will make clickable.
+      const links = new Set<string>();
+      const collect = (o: unknown) => {
+        const json = JSON.stringify(o ?? null);
+        for (const m of json.matchAll(/"((?:\/|https?:\/\/)[^"\s]{1,300})"/g)) links.add(m[1]!);
+      };
+      try {
+        // Look things up as many times as needed (at most 5 rounds), then answer.
+        for (let round = 0; round < 6; round++) {
+          const choice = round === 0 && NEEDS_DATA.test(lastUser) ? "required" : "auto";
+          const { text, calls } = await complete(messages, (d) => send({ t: "text", d }), () => send({ t: "reset_text" }), abort.signal, choice);
+          if (!calls.length || round === 5) break;
+          messages.push({ role: "assistant", content: text || null, tool_calls: calls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })) });
+          const results = await Promise.all(
+            calls.map(async (c) => {
+              let args: any = {};
+              try {
+                args = JSON.parse(c.args || "{}");
+              } catch {
+                /* model sent broken JSON: run with nothing */
+              }
+              send({ t: "status", text: toolLabel(c.name, args) });
+              try {
+                const r = await runTool(c.name, args);
+                collect(r.forModel);
+                collect(r.cards);
+                if (r.cards) send({ t: "cards", cards: r.cards });
+                return { id: c.id, content: JSON.stringify(r.forModel).slice(0, 5_000) };
+              } catch (e: any) {
+                return { id: c.id, content: JSON.stringify({ error: `Could not look that up right now (${String(e?.message || e).slice(0, 80)})` }) };
+              }
+            }),
+          );
+          for (const r of results) messages.push({ role: "tool", tool_call_id: r.id, content: r.content });
+        }
+        send({ t: "links", links: [...links].slice(0, 300) });
+        send({ t: "done" });
+      } catch (e: any) {
+        console.error("[assistant]", e?.message || e);
+        if (!abort.signal.aborted) send({ t: "error", text: "Sorry — I couldn't answer that just now. Please try again." });
+      } finally {
+        clearInterval(ping);
+        if (!closed) {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            /* already gone */
+          }
+        }
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
+  });
+}
