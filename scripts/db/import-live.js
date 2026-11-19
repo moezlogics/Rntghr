@@ -1,22 +1,30 @@
 /*
  * Rent Ghar — one-time live setup: creates the MongoDB user and database,
  * loads the exported data, sets the admin login, then deletes itself.
- * Run ON THE SERVER, from the project folder:
+ * Run ON THE SERVER, from the project folder, as root (see DEPLOY.md):
  *
  *   node scripts/db/import-live.js --admin-email you@example.com --admin-password 'a-strong-password'
  *
  * What it does, in order:
- *   1. Reads MONGODB_URI from apps/api/.env. If the URI has a user and
- *      password in it (mongodb://rentghar:PASSWORD@127.0.0.1:27017/rentghar),
- *      that MongoDB user is created with access to that one database only
- *      (readWrite + dbAdmin). If the user already exists and the password
- *      works, it is left alone.
+ *   1. Reads MONGODB_URI from apps/api/.env
+ *      (mongodb://rentghar:PASSWORD@127.0.0.1:27017/rentghar?authSource=rentghar)
+ *      and makes sure that MongoDB user exists with that password, with access
+ *      to that one database only (readWrite + dbAdmin):
+ *        - user already works            → left alone
+ *        - MongoDB has no login switched on → user created directly
+ *        - MongoDB has a login switched on and you don't have the admin
+ *          password → authentication is switched OFF in /etc/mongod.conf,
+ *          MongoDB restarted, the user created, then authentication switched
+ *          back ON exactly as it was and MongoDB restarted again (a few
+ *          seconds each). This part needs root. If you do know an admin login
+ *          you can pass it instead:
+ *            --admin-uri 'mongodb://ADMIN:PASS@127.0.0.1:27017/?authSource=admin'
  *   2. Creates the database and loads deploy/rentghar-db.json.gz (made on
  *      your PC by scripts/db/export-local.js): cities, areas, listings, media
  *      library, settings, plans. Copied listings arrive as drafts.
  *   3. Sets the dashboard admin login from --admin-email / --admin-password
  *      (the local test password never reaches the live site).
- *   4. Locks apps/api/.env and apps/web/.env to the owner (chmod 600), then
+ *   4. Locks apps/api/.env and apps/web/.env to their owner (chmod 600), then
  *      deletes the data file and this script, so neither the full data
  *      export nor a re-runnable import is left on the server. Pass --keep
  *      to leave both in place.
@@ -25,10 +33,10 @@
  *   - Refuses to touch a database that already has listings or users, unless
  *     you pass --replace (which drops the collections it is about to load).
  *   - --dry-run shows what would happen and changes nothing.
- *   - If MongoDB already has authentication switched on, the user can only be
- *     created with an admin login:
- *       --admin-uri 'mongodb://ADMIN:PASS@127.0.0.1:27017/?authSource=admin'
- *     On a fresh MongoDB install nothing extra is needed.
+ *   - If anything fails while authentication is off, it is still switched
+ *     back on (the original config is restored before the script exits).
+ *   - Advanced: --mongod-conf <path> (default /etc/mongod.conf) and
+ *     --restart-cmd '<command>' (default: systemctl restart mongod).
  *
  * Photos are not in this file: upload the uploads/ folder to
  * <project>/uploads (the API serves it at /uploads/...).
@@ -36,6 +44,7 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const { execSync } = require('child_process');
 const { MongoClient, BSON } = require('mongodb');
 const bcrypt = require('bcrypt');
 
@@ -47,6 +56,7 @@ const opt = (name) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 const DRY = flag('dry-run');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function readEnvUri() {
   if (process.env.MONGODB_URI) return process.env.MONGODB_URI;
@@ -58,10 +68,102 @@ function readEnvUri() {
 const isAuthError = (e) => e && (e.code === 18 || /Authentication failed|auth.*fail/i.test(e.message || ''));
 const isUnauthorized = (e) => e && (e.code === 13 || /requires authentication|not authorized|Unauthorized/i.test(e.message || ''));
 
+// ── MongoDB user ────────────────────────────────────────────────────────────
+
+/** Creates the user (or resets its password) through a connection that is allowed to. */
+async function createUserVia(connectUri, user, pwd, dbName, authDb) {
+  const roles = [
+    { role: 'readWrite', db: dbName },
+    { role: 'dbAdmin', db: dbName },
+  ];
+  const c = await MongoClient.connect(connectUri, { serverSelectionTimeoutMS: 5000 });
+  try {
+    const target = c.db(authDb);
+    const info = await target.command({ usersInfo: user });
+    if (info.users && info.users.length) {
+      await target.command({ updateUser: user, pwd, roles });
+      console.log(`MongoDB user "${user}": password reset to match apps/api/.env.`);
+    } else {
+      await target.command({ createUser: user, pwd, roles });
+      console.log(`MongoDB user "${user}": created (readWrite + dbAdmin on "${dbName}" only).`);
+    }
+  } finally {
+    await c.close();
+  }
+}
+
+function restartMongod() {
+  let cmd = opt('restart-cmd');
+  if (!cmd) {
+    for (const svc of ['mongod', 'mongodb']) {
+      try {
+        execSync(`systemctl cat ${svc}.service`, { stdio: 'ignore' });
+        cmd = `systemctl restart ${svc}`;
+        break;
+      } catch {
+        /* try the next name */
+      }
+    }
+  }
+  if (!cmd) throw new Error('Could not find the MongoDB service (mongod) to restart.');
+  execSync(cmd, { stdio: 'inherit' });
+}
+
+async function waitForMongo(hostUri) {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const c = await MongoClient.connect(hostUri, { serverSelectionTimeoutMS: 1500 });
+      await c.db('admin').command({ ping: 1 });
+      await c.close();
+      return;
+    } catch {
+      await sleep(750);
+    }
+  }
+  throw new Error('MongoDB did not come back up after the restart.');
+}
+
+/** Switches authentication off in mongod.conf, runs fn, and always switches it back on. */
+async function withAuthSwitchedOff(hostUri, fn) {
+  const conf = opt('mongod-conf') || '/etc/mongod.conf';
+  if (!fs.existsSync(conf)) throw new Error(`MongoDB config not found at ${conf} (pass --mongod-conf <path>).`);
+  const original = fs.readFileSync(conf, 'utf8');
+  const re = /^(\s*authorization\s*:\s*)["']?enabled["']?/m;
+  if (!re.test(original)) {
+    throw new Error(`MongoDB asks for a login, but ${conf} has no "authorization: enabled" line to switch off.`);
+  }
+  const backup = `${conf}.rentghar-backup`;
+  fs.writeFileSync(backup, original);
+
+  console.log('MongoDB asks for a login and no admin login was given: switching authentication OFF for a moment…');
+  fs.writeFileSync(conf, original.replace(re, '$1disabled'));
+  let failed = null;
+  try {
+    restartMongod();
+    await waitForMongo(hostUri);
+    await fn();
+  } catch (e) {
+    failed = e;
+  }
+
+  console.log('Switching MongoDB authentication back ON…');
+  fs.writeFileSync(conf, original);
+  try {
+    restartMongod();
+    await waitForMongo(hostUri);
+  } catch (e) {
+    console.error(`\nThe original ${conf} is back in place, but MongoDB did not restart cleanly: run  systemctl restart mongod`);
+    throw e;
+  }
+  fs.unlinkSync(backup);
+  console.log('MongoDB authentication is ON again.');
+  if (failed) throw failed;
+}
+
 /**
  * Step 1: make sure the MongoDB user in MONGODB_URI exists and can log in.
- * Returns the URI to read/write with — normally MONGODB_URI itself; in a dry
- * run where the user does not exist yet, the admin connection instead.
+ * Returns the URI to read/write the data with, or null in a dry run where the
+ * user does not exist yet (nothing can be read then).
  */
 async function ensureDbUser(uri, dbName) {
   const u = new URL(uri);
@@ -71,9 +173,12 @@ async function ensureDbUser(uri, dbName) {
     console.log('MONGODB_URI has no user in it: connecting without a MongoDB login.');
     return uri;
   }
+  const authDb = u.searchParams.get('authSource') || dbName;
+  const hostUri = `mongodb://${u.host}/`;
 
+  // Already set up?
   try {
-    const c = await MongoClient.connect(uri);
+    const c = await MongoClient.connect(uri, { serverSelectionTimeoutMS: 5000 });
     await c.db(dbName).command({ ping: 1 });
     await c.close();
     console.log(`MongoDB user "${user}": already exists, login OK.`);
@@ -82,41 +187,38 @@ async function ensureDbUser(uri, dbName) {
     if (!isAuthError(e)) throw e;
   }
 
-  const adminUri = opt('admin-uri') || `mongodb://${u.host}/`;
   if (DRY) {
     console.log(`would create MongoDB user "${user}" (readWrite + dbAdmin on "${dbName}")`);
-    return adminUri;
+    return null;
   }
 
-  const roles = [
-    { role: 'readWrite', db: dbName },
-    { role: 'dbAdmin', db: dbName },
-  ];
-  const admin = await MongoClient.connect(adminUri);
-  try {
-    const target = admin.db(u.searchParams.get('authSource') || dbName);
-    const info = await target.command({ usersInfo: user });
-    if (info.users && info.users.length) {
-      await target.command({ updateUser: user, pwd, roles });
-      console.log(`MongoDB user "${user}": password reset to match apps/api/.env.`);
-    } else {
-      await target.command({ createUser: user, pwd, roles });
-      console.log(`MongoDB user "${user}": created (readWrite + dbAdmin on "${dbName}" only).`);
-    }
-  } catch (e) {
-    if (isUnauthorized(e)) {
-      console.error('\nMongoDB has authentication switched on, so the user can only be created with an admin login. Run again with:');
-      console.error("  --admin-uri 'mongodb://ADMIN:PASS@127.0.0.1:27017/?authSource=admin'");
-      process.exit(1);
-    }
-    throw e;
-  } finally {
-    await admin.close();
+  // An admin login was given: use it.
+  if (opt('admin-uri')) {
+    await createUserVia(opt('admin-uri'), user, pwd, dbName, authDb);
+    return uri;
   }
+
+  // No admin login: works straight away when MongoDB has authentication off.
+  try {
+    await createUserVia(hostUri, user, pwd, dbName, authDb);
+    return uri;
+  } catch (e) {
+    if (!isUnauthorized(e)) throw e;
+  }
+
+  // Authentication is on and we have no admin login: off → create → on.
+  if (process.platform !== 'win32' && process.getuid && process.getuid() !== 0) {
+    console.error('\nMongoDB asks for a login. To create the user without the admin password, this script switches');
+    console.error('authentication off for a moment and back on, which needs root. Run it again as root (see DEPLOY.md).');
+    process.exit(1);
+  }
+  await withAuthSwitchedOff(hostUri, () => createUserVia(hostUri, user, pwd, dbName, authDb));
   return uri;
 }
 
-/** Step 4a: only the file's owner may read the secrets files (Linux; ignored elsewhere). */
+// ── Clean-up ────────────────────────────────────────────────────────────────
+
+/** Only the file's owner may read the secrets files (Linux; ignored elsewhere). */
 function lockEnvFiles() {
   for (const rel of ['apps/api/.env', 'apps/web/.env']) {
     const f = path.join(ROOT, rel);
@@ -130,12 +232,19 @@ function lockEnvFiles() {
   }
 }
 
+// ── Main ────────────────────────────────────────────────────────────────────
+
 (async () => {
   // Check everything first, so a mistake stops the script before it changes anything.
   const file = path.resolve(ROOT, opt('file') || 'deploy/rentghar-db.json.gz');
   const uri = readEnvUri();
   if (!uri) {
     console.error('MONGODB_URI is not set. Upload the live .env to apps/api/.env first.');
+    process.exit(1);
+  }
+  if (/CHANGE_ME/i.test(uri)) {
+    console.error('MONGODB_URI still has the placeholder password. Put your own password in apps/api/.env first');
+    console.error('(letters and numbers only — e.g. the output of:  openssl rand -hex 16).');
     process.exit(1);
   }
   if (!fs.existsSync(file)) {
@@ -148,7 +257,13 @@ function lockEnvFiles() {
     console.error('Pass --admin-email and --admin-password (at least 10 characters) for the live dashboard login.');
     process.exit(1);
   }
-  const dbName = new URL(uri).pathname.replace(/^\//, '');
+  let dbName;
+  try {
+    dbName = new URL(uri).pathname.replace(/^\//, '');
+  } catch {
+    console.error('MONGODB_URI is not a valid address. Use letters and numbers only in the password.');
+    process.exit(1);
+  }
   if (!dbName) {
     console.error('MONGODB_URI has no database name (…:27017/rentghar).');
     process.exit(1);
@@ -160,6 +275,10 @@ function lockEnvFiles() {
 
   // 1. MongoDB user
   const workUri = await ensureDbUser(uri, dbName);
+  if (!workUri) {
+    for (const name of names) console.log(`would load ${name.padEnd(20)} ${dump.collections[name].length}`);
+    return;
+  }
 
   // 2. Database + data
   const client = await MongoClient.connect(workUri);
@@ -222,7 +341,7 @@ function lockEnvFiles() {
         }
       }
     }
-    console.log('\nNext:  pm2 start ecosystem.config.js && pm2 save   (or pm2 restart rentghar-api if it is already running)');
+    console.log('\nNext (as the site user):  pm2 start ecosystem.config.js && pm2 save');
   }
 })().catch((e) => {
   console.error(e.message || e);
