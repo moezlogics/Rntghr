@@ -32,6 +32,7 @@ pm2 save
 
 - The import creates the `rentghar` database and loads everything (cities, areas, listings, media library, settings, plans). Listings copied from other portals arrive as **drafts**: open *Dashboard → Properties → Draft*, check each one, and publish it.
 - `--admin-email` / `--admin-password` become the dashboard login. The local test password is never used on the live site.
+- When the import succeeds, the script **deletes itself and `deploy/rentghar-db.json.gz`** from the server (add `--keep` to keep them). `git status` will then show `scripts/db/import-live.js` as deleted — that is expected; `git checkout -- scripts/db/import-live.js` brings it back if you ever need it.
 - The domain must point at port **3117** (CloudPanel: Node.js site, app port 3117). `/api`, `/uploads` and `/img` are forwarded to the API by the website itself.
 
 ## Updating later

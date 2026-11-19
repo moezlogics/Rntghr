@@ -15,6 +15,9 @@
  *     admin account that comes across (or create it): the local test
  *     password never reaches the live site.
  *   - --dry-run shows what would be loaded and changes nothing.
+ *   - After a successful import the script deletes itself and the data file
+ *     (deploy/rentghar-db.json.gz), so neither is left on the server. Pass
+ *     --keep to leave both in place.
  *
  * Photos are not in this file: upload the uploads/ folder to
  * <project>/uploads (the API serves it at /uploads/...).
@@ -105,6 +108,19 @@ function readEnvUri() {
     console.log('Restart the API so it builds its indexes:  pm2 restart rentghar-api');
   }
   await client.close();
+
+  // Done: remove the data file and this script, so the import cannot be run
+  // again by accident and the full data export is not left lying on the server.
+  if (!flag('dry-run') && !flag('keep')) {
+    for (const f of [file, __filename]) {
+      try {
+        fs.unlinkSync(f);
+        console.log(`Deleted ${path.relative(ROOT, f)}`);
+      } catch (e) {
+        console.warn(`Could not delete ${path.relative(ROOT, f)}: ${e.message}`);
+      }
+    }
+  }
 })().catch((e) => {
   console.error(e);
   process.exit(1);
