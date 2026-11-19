@@ -1,60 +1,56 @@
 import Link from 'next/link';
-import { RENT_TYPE_ART } from '@/components/home/RentTypeArt';
+import type { LucideIcon } from 'lucide-react';
+import { ArrowDown, ArrowUp, BedDouble, Briefcase, Building, Building2, Home, Store, Warehouse } from 'lucide-react';
 
 /*
- * "What are you looking to rent?" — every rental type as a little building
- * with the part you'd rent lit up. On a phone the tiles scroll sideways; on a
- * desktop they sit in one row. Each tile is a real landing page
- * (/properties/rent/<type>), so this also gives search engines a clean path
- * to every type.
+ * "What are you looking to rent?" — the rental types as a compact category
+ * row, the way modern apps list categories: a thin-line icon in a soft round
+ * tile with the name under it. Scrolls sideways on a phone, one even row on a
+ * desktop. Each item is a real landing page (/properties/rent/<type>), so this
+ * also gives search engines a clean path to every type.
  */
 
-const TYPES = [
-  { slug: 'house', label: 'Whole house', note: 'For families' },
-  { slug: 'upper-portion', label: 'Upper portion', note: 'Own floor, own gate' },
-  { slug: 'lower-portion', label: 'Lower portion', note: 'Ground floor' },
-  { slug: 'flat', label: 'Flat', note: 'In a building' },
-  { slug: 'room', label: 'Room', note: 'Single or shared' },
-  { slug: 'hostel', label: 'Hostel', note: 'Students & jobs' },
-  { slug: 'shop', label: 'Shop', note: 'Market & plaza' },
-  { slug: 'office', label: 'Office', note: 'Floor or suite' },
-  { slug: 'warehouse', label: 'Warehouse', note: 'Godown & storage' },
-] as const;
+type Item = { slug: string; label: string; icon: LucideIcon; badge?: LucideIcon };
+
+const TYPES: Item[] = [
+  { slug: 'house', label: 'House', icon: Home },
+  { slug: 'upper-portion', label: 'Upper portion', icon: Home, badge: ArrowUp },
+  { slug: 'lower-portion', label: 'Lower portion', icon: Home, badge: ArrowDown },
+  { slug: 'flat', label: 'Flat', icon: Building },
+  { slug: 'room', label: 'Room', icon: BedDouble },
+  { slug: 'hostel', label: 'Hostel', icon: Building2 },
+  { slug: 'shop', label: 'Shop', icon: Store },
+  { slug: 'office', label: 'Office', icon: Briefcase },
+  { slug: 'warehouse', label: 'Warehouse', icon: Warehouse },
+];
 
 export default function HomeRentTypes() {
   return (
-    <section className="pt-6 sm:pt-10" aria-labelledby="rent-types-heading">
+    <section className="pt-5 sm:pt-8" aria-labelledby="rent-types-heading">
       <div className="container mx-auto px-3 sm:px-4">
-        <div className="mb-3 flex items-end justify-between gap-3 sm:mb-4">
-          <div>
-            <h2 id="rent-types-heading" className="text-[19px] font-bold tracking-tight text-slate-900 sm:text-[24px]">
-              What are you looking to rent?
-            </h2>
-            <p className="mt-0.5 text-[12.5px] text-slate-500 sm:text-[14px]">
-              The part in <span className="font-semibold text-[var(--price-tag)]">orange</span> is what you get.
-            </p>
-          </div>
-        </div>
-        <div className="hide-scrollbar -mx-[var(--gutter)] flex snap-x gap-2.5 overflow-x-auto px-[var(--gutter)] pb-1 sm:mx-0 sm:grid sm:grid-cols-5 sm:px-0 lg:grid-cols-9">
-          {TYPES.map(({ slug, label, note }) => {
-            const Art = RENT_TYPE_ART[slug]!;
-            return (
+        <h2 id="rent-types-heading" className="mb-2 text-[18px] font-bold tracking-tight text-slate-900 sm:mb-3 sm:text-[22px]">
+          What are you looking to rent?
+        </h2>
+        <ul className="hide-scrollbar -mx-[var(--gutter)] flex gap-0.5 overflow-x-auto px-[var(--gutter)] sm:mx-0 sm:grid sm:grid-cols-9 sm:gap-2 sm:px-0">
+          {TYPES.map(({ slug, label, icon: Icon, badge: Badge }) => (
+            <li key={slug} className="shrink-0">
               <Link
-                key={slug}
                 href={`/properties/rent/${slug}`}
-                className="group relative flex w-[118px] shrink-0 snap-start flex-col overflow-hidden rounded-[20px] bg-white ring-1 ring-slate-200/80 transition-[box-shadow,transform] hover:-translate-y-0.5 hover:shadow-[0_14px_30px_-18px_rgba(15,23,42,0.35)] hover:ring-primary/30 sm:w-auto"
+                className="group flex w-[70px] flex-col items-center gap-1.5 rounded-2xl px-0.5 py-2 text-center transition-colors focus-visible:outline-2 focus-visible:outline-primary sm:w-full sm:hover:bg-white"
               >
-                <span className="relative grid h-[84px] place-items-center bg-[linear-gradient(180deg,var(--accent)_0%,#ffffff_100%)] text-navy">
-                  <Art className="h-[60px] w-[68px] transition-transform duration-300 group-hover:scale-110" />
+                <span className="relative grid h-12 w-12 place-items-center rounded-full bg-white text-primary shadow-[0_1px_2px_rgba(15,23,42,0.06)] ring-1 ring-slate-200/80 transition-colors group-hover:bg-primary group-hover:text-white group-hover:ring-primary sm:h-14 sm:w-14">
+                  <Icon className="h-[22px] w-[22px] sm:h-6 sm:w-6" strokeWidth={1.6} aria-hidden />
+                  {Badge && (
+                    <span className="absolute -right-0.5 -top-0.5 grid h-[18px] w-[18px] place-items-center rounded-full bg-primary text-white ring-2 ring-white transition-colors group-hover:bg-white group-hover:text-primary">
+                      <Badge className="h-2.5 w-2.5" strokeWidth={3} aria-hidden />
+                    </span>
+                  )}
                 </span>
-                <span className="px-3 pb-3 pt-2">
-                  <span className="block text-[13px] font-bold leading-tight text-slate-900">{label}</span>
-                  <span className="mt-0.5 block text-[11px] leading-tight text-slate-500">{note}</span>
-                </span>
+                <span className="text-[11.5px] font-medium leading-tight text-slate-700 group-hover:text-slate-900 sm:text-[12.5px]">{label}</span>
               </Link>
-            );
-          })}
-        </div>
+            </li>
+          ))}
+        </ul>
       </div>
     </section>
   );

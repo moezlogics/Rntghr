@@ -10,10 +10,9 @@ import { isPropertyDetail } from '@/lib/routes';
 import { cn, toTitleCase } from '@/lib/utils';
 
 /*
- * Cities as a row of rounded photo tiles (once round "story" shortcuts — a photo in a ring of the
- * theme colour, the name underneath — the way apps show categories you can
- * tap through. Four fit across a phone and the rest scroll; a desktop shows
- * more. Sorted by popularity (major cities first), then live listings count.
+ * Cities as round "story" shortcuts — a photo in a ring of the theme colour,
+ * the name underneath — the way apps show categories you can tap through.
+ * Five fit across a phone and the rest scroll; a desktop shows more. Sorted by popularity (major cities first), then live listings count.
  *
  * Homepage: the ten most popular and a "View all" circle. Results pages: all
  * of them, with the current city highlighted, linking within the same
@@ -96,7 +95,7 @@ export default function CityStories({
   const shown = typeof limit === 'number' ? cities.slice(0, limit) : cities;
   const hrefFor = (slug: string) => `/properties/rent/${slug}`;
 
-  const arrow = 'absolute top-[42px] z-10 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full bg-white text-slate-900 shadow-[0_2px_10px_rgba(15,23,42,0.18)] ring-1 ring-slate-200 transition-opacity hover:bg-slate-50 sm:top-[48px] sm:h-9 sm:w-9';
+  const arrow = 'absolute top-[32px] z-10 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full bg-white text-slate-900 shadow-[0_2px_10px_rgba(15,23,42,0.18)] ring-1 ring-slate-200 transition-opacity hover:bg-slate-50 sm:top-[40px] sm:h-9 sm:w-9';
 
   return (
     <div className="relative">
@@ -110,7 +109,7 @@ export default function CityStories({
           <ChevronRight className="h-5 w-5" />
         </button>
       )}
-    <div ref={scroller} onScroll={measure} className={cn('hide-scrollbar -mx-[var(--gutter)] flex snap-x gap-2 overflow-x-auto scroll-smooth px-[var(--gutter)] sm:mx-0 sm:px-0', className)}>
+    <div ref={scroller} onScroll={measure} className={cn('hide-scrollbar -mx-[var(--gutter)] flex snap-x gap-1 overflow-x-auto sm:gap-2 scroll-smooth px-[var(--gutter)] sm:mx-0 sm:px-0', className)}>
       {shown.map((city, i) => {
         const active = currentCity === city.slug;
         const src = imageFor(city);
@@ -118,18 +117,26 @@ export default function CityStories({
           <Link
             key={city._id}
             href={hrefFor(city.slug)}
-            className={cn(
-              'group relative block h-[84px] w-[112px] shrink-0 snap-start overflow-hidden rounded-2xl bg-primary/10 sm:h-[96px] sm:w-[136px]',
-              active && 'ring-2 ring-primary ring-offset-2',
-            )}
+            aria-current={active ? 'page' : undefined}
+            className="group flex w-[68px] shrink-0 snap-start flex-col items-center gap-1.5 py-1 sm:w-[80px]"
           >
-            {src ? (
-              <Image src={src} loader={photoLoader} alt={toTitleCase(city.name)} fill sizes="136px" className="object-cover transition-transform duration-300 group-hover:scale-105" priority={i < 4} />
-            ) : (
-              <span className="absolute inset-0 bg-gradient-to-br from-primary to-navy" />
-            )}
-            <span className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent" />
-            <span className="absolute inset-x-2 bottom-1.5 line-clamp-1 text-left text-[13px] font-bold text-white sm:text-[14px]">
+            <span
+              className={cn(
+                'rounded-full p-[2px] transition-colors',
+                active ? 'bg-primary' : 'bg-slate-200 group-hover:bg-primary',
+              )}
+            >
+              <span className="relative block h-[58px] w-[58px] overflow-hidden rounded-full bg-primary/10 ring-2 ring-white sm:h-[70px] sm:w-[70px]">
+                {src ? (
+                  <Image src={src} loader={photoLoader} alt="" fill sizes="72px" className="object-cover transition-transform duration-300 group-hover:scale-110" priority={i < 5} />
+                ) : (
+                  <span className="absolute inset-0 grid place-items-center bg-gradient-to-br from-primary to-navy text-[20px] font-bold text-white">
+                    {city.name.trim().charAt(0).toUpperCase()}
+                  </span>
+                )}
+              </span>
+            </span>
+            <span className={cn('line-clamp-1 max-w-full text-[11.5px] leading-tight sm:text-[12.5px]', active ? 'font-bold text-primary' : 'font-medium text-slate-700 group-hover:text-slate-900')}>
               {toTitleCase(city.name)}
             </span>
           </Link>
@@ -137,8 +144,11 @@ export default function CityStories({
       })}
 
       {viewAllHref && (
-        <Link href={viewAllHref} className="grid h-[84px] w-[96px] shrink-0 snap-start place-items-center rounded-2xl border border-dashed border-primary/40 bg-white text-[12.5px] font-semibold text-primary sm:h-[96px]">
-          <span className="flex flex-col items-center gap-1"><ArrowRight className="h-5 w-5" />View all</span>
+        <Link href={viewAllHref} className="group flex w-[68px] shrink-0 snap-start flex-col items-center gap-1.5 py-1 sm:w-[80px]">
+          <span className="grid h-[62px] w-[62px] place-items-center rounded-full border border-dashed border-primary/50 bg-white text-primary transition-colors group-hover:bg-primary group-hover:text-white sm:h-[74px] sm:w-[74px]">
+            <ArrowRight className="h-5 w-5" />
+          </span>
+          <span className="text-[11.5px] font-semibold leading-tight text-primary sm:text-[12.5px]">View all</span>
         </Link>
       )}
     </div>

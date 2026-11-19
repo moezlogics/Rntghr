@@ -148,12 +148,12 @@ export default async function Home() {
         </section>
       )}
       <AdZone page="home" at="after:cities" className="my-4" wrap="container mx-auto px-[var(--gutter)] sm:px-4" />
-      <HomeRentTypes />
-      <AdZone page="home" at="after:types" className="my-4" wrap="container mx-auto px-[var(--gutter)] sm:px-4" />
       {settings.homeShowLatest && (
         <FeaturedSection initialProperties={transformedProperties} count={settings.homeLatestCount} />
       )}
       <AdZone page="home" at="after:latest" className="my-6" wrap="container mx-auto px-[var(--gutter)] sm:px-4" />
+      <HomeRentTypes />
+      <AdZone page="home" at="after:types" className="my-4" wrap="container mx-auto px-[var(--gutter)] sm:px-4" />
       <HomeHowItWorks />
       <AdZone page="home" at="after:how" className="my-6" wrap="container mx-auto px-[var(--gutter)] sm:px-4" />
       {settings.homeShowAgencies && <VerifiedAgencies agencies={agencies} dealersHref={dealersHref} />}
